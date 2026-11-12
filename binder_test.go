@@ -1,4 +1,6 @@
-// run tests as external package to get real feel for API
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: © 2015 LabStack LLC and Echo contributors
+
 package echo
 
 import (
@@ -7,6 +9,7 @@ import (
 	"fmt"
 	"github.com/stretchr/testify/assert"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -15,7 +18,7 @@ import (
 	"time"
 )
 
-func createTestContext(URL string, body io.Reader, pathParams map[string]string) Context {
+func createTestContext(URL string, body io.Reader, pathValues map[string]string) *Context {
 	e := New()
 	req := httptest.NewRequest(http.MethodGet, URL, body)
 	if body != nil {
@@ -24,15 +27,15 @@ func createTestContext(URL string, body io.Reader, pathParams map[string]string)
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	if len(pathParams) > 0 {
-		names := make([]string, 0)
-		values := make([]string, 0)
-		for name, value := range pathParams {
-			names = append(names, name)
-			values = append(values, value)
+	if len(pathValues) > 0 {
+		params := make(PathValues, 0)
+		for name, value := range pathValues {
+			params = append(params, PathValue{
+				Name:  name,
+				Value: value,
+			})
 		}
-		c.SetParamNames(names...)
-		c.SetParamValues(values...)
+		c.SetPathValues(params)
 	}
 
 	return c
@@ -40,12 +43,12 @@ func createTestContext(URL string, body io.Reader, pathParams map[string]string)
 
 func TestBindingError_Error(t *testing.T) {
 	err := NewBindingError("id", []string{"1", "nope"}, "bind failed", errors.New("internal error"))
-	assert.EqualError(t, err, `code=400, message=bind failed, internal=internal error, field=id`)
+	assert.EqualError(t, err, `code=400, message=bind failed, err=internal error, field=id`)
 
 	bErr := err.(*BindingError)
 	assert.Equal(t, 400, bErr.Code)
 	assert.Equal(t, "bind failed", bErr.Message)
-	assert.Equal(t, errors.New("internal error"), bErr.Internal)
+	assert.Equal(t, errors.New("internal error"), bErr.err)
 
 	assert.Equal(t, "id", bErr.Field)
 	assert.Equal(t, []string{"1", "nope"}, bErr.Values)
@@ -54,18 +57,18 @@ func TestBindingError_Error(t *testing.T) {
 func TestBindingError_ErrorJSON(t *testing.T) {
 	err := NewBindingError("id", []string{"1", "nope"}, "bind failed", errors.New("internal error"))
 
-	resp, err := json.Marshal(err)
+	resp, _ := json.Marshal(err)
 
 	assert.Equal(t, `{"field":"id","message":"bind failed"}`, string(resp))
 }
 
-func TestPathParamsBinder(t *testing.T) {
+func TestPathValuesBinder(t *testing.T) {
 	c := createTestContext("/api/user/999", nil, map[string]string{
 		"id":    "1",
 		"nr":    "2",
 		"slice": "3",
 	})
-	b := PathParamsBinder(c)
+	b := PathValuesBinder(c)
 
 	id := int64(99)
 	nr := int64(88)
@@ -88,15 +91,15 @@ func TestQueryParamsBinder_FailFast(t *testing.T) {
 	var testCases = []struct {
 		name          string
 		whenURL       string
-		givenFailFast bool
 		expectError   []string
+		givenFailFast bool
 	}{
 		{
 			name:          "ok, FailFast=true stops at first error",
 			whenURL:       "/api/user/999?nr=en&id=nope",
 			givenFailFast: true,
 			expectError: []string{
-				`code=400, message=failed to bind field value to int64, internal=strconv.ParseInt: parsing "nope": invalid syntax, field=id`,
+				`code=400, message=failed to bind field value to int64, err=strconv.ParseInt: parsing "nope": invalid syntax, field=id`,
 			},
 		},
 		{
@@ -104,8 +107,8 @@ func TestQueryParamsBinder_FailFast(t *testing.T) {
 			whenURL:       "/api/user/999?nr=en&id=nope",
 			givenFailFast: false,
 			expectError: []string{
-				`code=400, message=failed to bind field value to int64, internal=strconv.ParseInt: parsing "nope": invalid syntax, field=id`,
-				`code=400, message=failed to bind field value to int64, internal=strconv.ParseInt: parsing "en": invalid syntax, field=nr`,
+				`code=400, message=failed to bind field value to int64, err=strconv.ParseInt: parsing "nope": invalid syntax, field=id`,
+				`code=400, message=failed to bind field value to int64, err=strconv.ParseInt: parsing "en": invalid syntax, field=nr`,
 			},
 		},
 	}
@@ -162,7 +165,7 @@ func TestFormFieldBinder(t *testing.T) {
 }
 
 func TestValueBinder_errorStopsBinding(t *testing.T) {
-	// this test documents "feature" that binding multiple params can change destination if it was binded before
+	// this test documents "feature" that binding multiple params can change destination if it was bound before
 	// failing parameter binding
 
 	c := createTestContext("/api/user/999?id=1&nr=nope", nil, nil)
@@ -174,7 +177,7 @@ func TestValueBinder_errorStopsBinding(t *testing.T) {
 		Int64("nr", &nr).
 		BindError()
 
-	assert.EqualError(t, err, "code=400, message=failed to bind field value to int64, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=nr")
+	assert.EqualError(t, err, "code=400, message=failed to bind field value to int64, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=nr")
 	assert.Equal(t, int64(1), id)
 	assert.Equal(t, int64(88), nr)
 }
@@ -189,17 +192,17 @@ func TestValueBinder_BindError(t *testing.T) {
 		Int64("nr", &nr).
 		BindError()
 
-	assert.EqualError(t, err, "code=400, message=failed to bind field value to int64, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=id")
+	assert.EqualError(t, err, "code=400, message=failed to bind field value to int64, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=id")
 	assert.Nil(t, b.errors)
 	assert.Nil(t, b.BindError())
 }
 
 func TestValueBinder_GetValues(t *testing.T) {
 	var testCases = []struct {
-		name           string
 		whenValuesFunc func(sourceParam string) []string
-		expect         []int64
+		name           string
 		expectError    string
+		expect         []int64
 	}{
 		{
 			name:   "ok, default implementation",
@@ -263,13 +266,13 @@ func TestValueBinder_CustomFuncWithError(t *testing.T) {
 
 func TestValueBinder_CustomFunc(t *testing.T) {
 	var testCases = []struct {
+		expectValue       any
 		name              string
-		givenFailFast     bool
-		givenFuncErrors   []error
 		whenURL           string
+		givenFuncErrors   []error
 		expectParamValues []string
-		expectValue       interface{}
 		expectErrors      []string
+		givenFailFast     bool
 	}{
 		{
 			name:              "ok, binds value",
@@ -338,13 +341,13 @@ func TestValueBinder_CustomFunc(t *testing.T) {
 
 func TestValueBinder_MustCustomFunc(t *testing.T) {
 	var testCases = []struct {
+		expectValue       any
 		name              string
-		givenFailFast     bool
-		givenFuncErrors   []error
 		whenURL           string
+		givenFuncErrors   []error
 		expectParamValues []string
-		expectValue       interface{}
 		expectErrors      []string
+		givenFailFast     bool
 	}{
 		{
 			name:              "ok, binds value",
@@ -415,12 +418,12 @@ func TestValueBinder_MustCustomFunc(t *testing.T) {
 func TestValueBinder_String(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
 		expectValue     string
 		expectError     string
+		givenBindErrors []error
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -491,12 +494,12 @@ func TestValueBinder_String(t *testing.T) {
 func TestValueBinder_Strings(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     []string
 		expectError     string
+		givenBindErrors []error
+		expectValue     []string
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -567,12 +570,12 @@ func TestValueBinder_Strings(t *testing.T) {
 func TestValueBinder_Int64_intValue(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     int64
 		expectError     string
+		givenBindErrors []error
+		expectValue     int64
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -595,7 +598,7 @@ func TestValueBinder_Int64_intValue(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: 99,
-			expectError: "code=400, message=failed to bind field value to int64, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to int64, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -623,7 +626,7 @@ func TestValueBinder_Int64_intValue(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: 99,
-			expectError: "code=400, message=failed to bind field value to int64, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to int64, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -664,19 +667,19 @@ func TestValueBinder_Int_errorMessage(t *testing.T) {
 
 	assert.Equal(t, 99, destInt)
 	assert.Equal(t, uint(98), destUint)
-	assert.EqualError(t, errs[0], `code=400, message=failed to bind field value to int, internal=strconv.ParseInt: parsing "nope": invalid syntax, field=param`)
-	assert.EqualError(t, errs[1], `code=400, message=failed to bind field value to uint, internal=strconv.ParseUint: parsing "nope": invalid syntax, field=param`)
+	assert.EqualError(t, errs[0], `code=400, message=failed to bind field value to int, err=strconv.ParseInt: parsing "nope": invalid syntax, field=param`)
+	assert.EqualError(t, errs[1], `code=400, message=failed to bind field value to uint, err=strconv.ParseUint: parsing "nope": invalid syntax, field=param`)
 }
 
 func TestValueBinder_Uint64_uintValue(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     uint64
 		expectError     string
+		givenBindErrors []error
+		expectValue     uint64
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -699,7 +702,7 @@ func TestValueBinder_Uint64_uintValue(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: 99,
-			expectError: "code=400, message=failed to bind field value to uint64, internal=strconv.ParseUint: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to uint64, err=strconv.ParseUint: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -727,7 +730,7 @@ func TestValueBinder_Uint64_uintValue(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: 99,
-			expectError: "code=400, message=failed to bind field value to uint64, internal=strconv.ParseUint: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to uint64, err=strconv.ParseUint: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -878,12 +881,12 @@ func TestValueBinder_Int_Types(t *testing.T) {
 func TestValueBinder_Int64s_intsValue(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     []int64
 		expectError     string
+		givenBindErrors []error
+		expectValue     []int64
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -906,7 +909,7 @@ func TestValueBinder_Int64s_intsValue(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: []int64{99},
-			expectError: "code=400, message=failed to bind field value to int64, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to int64, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -934,7 +937,7 @@ func TestValueBinder_Int64s_intsValue(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: []int64{99},
-			expectError: "code=400, message=failed to bind field value to int64, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to int64, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -967,12 +970,12 @@ func TestValueBinder_Int64s_intsValue(t *testing.T) {
 func TestValueBinder_Uint64s_uintsValue(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     []uint64
 		expectError     string
+		givenBindErrors []error
+		expectValue     []uint64
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -995,7 +998,7 @@ func TestValueBinder_Uint64s_uintsValue(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: []uint64{99},
-			expectError: "code=400, message=failed to bind field value to uint64, internal=strconv.ParseUint: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to uint64, err=strconv.ParseUint: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -1023,7 +1026,7 @@ func TestValueBinder_Uint64s_uintsValue(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: []uint64{99},
-			expectError: "code=400, message=failed to bind field value to uint64, internal=strconv.ParseUint: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to uint64, err=strconv.ParseUint: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -1166,7 +1169,7 @@ func TestValueBinder_Ints_Types(t *testing.T) {
 
 func TestValueBinder_Ints_Types_FailFast(t *testing.T) {
 	// FailFast() should stop parsing and return early
-	errTmpl := "code=400, message=failed to bind field value to %v, internal=strconv.Parse%v: parsing \"nope\": invalid syntax, field=param"
+	errTmpl := "code=400, message=failed to bind field value to %v, err=strconv.Parse%v: parsing \"nope\": invalid syntax, field=param"
 	c := createTestContext("/search?param=1&param=nope&param=2", nil, nil)
 
 	var dest64 []int64
@@ -1223,12 +1226,12 @@ func TestValueBinder_Ints_Types_FailFast(t *testing.T) {
 func TestValueBinder_Bool(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
+		expectError     string
+		givenBindErrors []error
+		givenFailFast   bool
 		whenMust        bool
 		expectValue     bool
-		expectError     string
 	}{
 		{
 			name:        "ok, binds value",
@@ -1251,7 +1254,7 @@ func TestValueBinder_Bool(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: false,
-			expectError: "code=400, message=failed to bind field value to bool, internal=strconv.ParseBool: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to bool, err=strconv.ParseBool: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -1279,7 +1282,7 @@ func TestValueBinder_Bool(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: false,
-			expectError: "code=400, message=failed to bind field value to bool, internal=strconv.ParseBool: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to bool, err=strconv.ParseBool: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -1312,12 +1315,12 @@ func TestValueBinder_Bool(t *testing.T) {
 func TestValueBinder_Bools(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     []bool
 		expectError     string
+		givenBindErrors []error
+		expectValue     []bool
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -1341,14 +1344,14 @@ func TestValueBinder_Bools(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=true&param=nope&param=100",
 			expectValue: []bool(nil),
-			expectError: "code=400, message=failed to bind field value to bool, internal=strconv.ParseBool: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to bool, err=strconv.ParseBool: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:          "nok, conversion fails fast, value is not changed",
 			givenFailFast: true,
 			whenURL:       "/search?param=true&param=nope&param=100",
 			expectValue:   []bool(nil),
-			expectError:   "code=400, message=failed to bind field value to bool, internal=strconv.ParseBool: parsing \"nope\": invalid syntax, field=param",
+			expectError:   "code=400, message=failed to bind field value to bool, err=strconv.ParseBool: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -1377,7 +1380,7 @@ func TestValueBinder_Bools(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: []bool(nil),
-			expectError: "code=400, message=failed to bind field value to bool, internal=strconv.ParseBool: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to bool, err=strconv.ParseBool: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -1408,12 +1411,12 @@ func TestValueBinder_Bools(t *testing.T) {
 func TestValueBinder_Float64(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     float64
 		expectError     string
+		givenBindErrors []error
+		expectValue     float64
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -1436,7 +1439,7 @@ func TestValueBinder_Float64(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: 1.123,
-			expectError: "code=400, message=failed to bind field value to float64, internal=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to float64, err=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -1464,7 +1467,7 @@ func TestValueBinder_Float64(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: 1.123,
-			expectError: "code=400, message=failed to bind field value to float64, internal=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to float64, err=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -1497,12 +1500,12 @@ func TestValueBinder_Float64(t *testing.T) {
 func TestValueBinder_Float64s(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     []float64
 		expectError     string
+		givenBindErrors []error
+		expectValue     []float64
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -1526,14 +1529,14 @@ func TestValueBinder_Float64s(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: []float64(nil),
-			expectError: "code=400, message=failed to bind field value to float64, internal=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to float64, err=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:          "nok, conversion fails fast, value is not changed",
 			givenFailFast: true,
 			whenURL:       "/search?param=0&param=nope&param=100",
 			expectValue:   []float64(nil),
-			expectError:   "code=400, message=failed to bind field value to float64, internal=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
+			expectError:   "code=400, message=failed to bind field value to float64, err=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -1562,7 +1565,7 @@ func TestValueBinder_Float64s(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: []float64(nil),
-			expectError: "code=400, message=failed to bind field value to float64, internal=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to float64, err=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -1593,12 +1596,12 @@ func TestValueBinder_Float64s(t *testing.T) {
 func TestValueBinder_Float32(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenNoFailFast bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     float32
 		expectError     string
+		givenBindErrors []error
+		expectValue     float32
+		givenNoFailFast bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -1621,7 +1624,7 @@ func TestValueBinder_Float32(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: 1.123,
-			expectError: "code=400, message=failed to bind field value to float32, internal=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to float32, err=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -1649,7 +1652,7 @@ func TestValueBinder_Float32(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: 1.123,
-			expectError: "code=400, message=failed to bind field value to float32, internal=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to float32, err=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -1682,12 +1685,12 @@ func TestValueBinder_Float32(t *testing.T) {
 func TestValueBinder_Float32s(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     []float32
 		expectError     string
+		givenBindErrors []error
+		expectValue     []float32
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -1711,14 +1714,14 @@ func TestValueBinder_Float32s(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: []float32(nil),
-			expectError: "code=400, message=failed to bind field value to float32, internal=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to float32, err=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:          "nok, conversion fails fast, value is not changed",
 			givenFailFast: true,
 			whenURL:       "/search?param=0&param=nope&param=100",
 			expectValue:   []float32(nil),
-			expectError:   "code=400, message=failed to bind field value to float32, internal=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
+			expectError:   "code=400, message=failed to bind field value to float32, err=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -1747,7 +1750,7 @@ func TestValueBinder_Float32s(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: []float32(nil),
-			expectError: "code=400, message=failed to bind field value to float32, internal=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to float32, err=strconv.ParseFloat: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -1778,14 +1781,14 @@ func TestValueBinder_Float32s(t *testing.T) {
 func TestValueBinder_Time(t *testing.T) {
 	exampleTime, _ := time.Parse(time.RFC3339, "2020-12-23T09:45:31+02:00")
 	var testCases = []struct {
-		name            string
-		givenFailFast   bool
-		givenBindErrors []error
-		whenURL         string
-		whenMust        bool
-		whenLayout      string
 		expectValue     time.Time
+		name            string
+		whenURL         string
+		whenLayout      string
 		expectError     string
+		givenBindErrors []error
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -1860,13 +1863,13 @@ func TestValueBinder_Times(t *testing.T) {
 	exampleTime2, _ := time.Parse(time.RFC3339, "2000-01-02T09:45:31+00:00")
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
 		whenLayout      string
-		expectValue     []time.Time
 		expectError     string
+		givenBindErrors []error
+		expectValue     []time.Time
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -1945,12 +1948,12 @@ func TestValueBinder_Duration(t *testing.T) {
 	example := 42 * time.Second
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     time.Duration
 		expectError     string
+		givenBindErrors []error
+		expectValue     time.Duration
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -2023,12 +2026,12 @@ func TestValueBinder_Durations(t *testing.T) {
 	exampleDuration2 := 1 * time.Millisecond
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     []time.Duration
 		expectError     string
+		givenBindErrors []error
+		expectValue     []time.Duration
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -2100,13 +2103,13 @@ func TestValueBinder_BindUnmarshaler(t *testing.T) {
 	exampleTime, _ := time.Parse(time.RFC3339, "2020-12-23T09:45:31+02:00")
 
 	var testCases = []struct {
-		name            string
-		givenFailFast   bool
-		givenBindErrors []error
-		whenURL         string
-		whenMust        bool
 		expectValue     Timestamp
+		name            string
+		whenURL         string
 		expectError     string
+		givenBindErrors []error
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -2129,7 +2132,7 @@ func TestValueBinder_BindUnmarshaler(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: Timestamp{},
-			expectError: "code=400, message=failed to bind field value to BindUnmarshaler interface, internal=parsing time \"nope\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"nope\" as \"2006\", field=param",
+			expectError: "code=400, message=failed to bind field value to BindUnmarshaler interface, err=parsing time \"nope\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"nope\" as \"2006\", field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -2157,7 +2160,7 @@ func TestValueBinder_BindUnmarshaler(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: Timestamp{},
-			expectError: "code=400, message=failed to bind field value to BindUnmarshaler interface, internal=parsing time \"nope\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"nope\" as \"2006\", field=param",
+			expectError: "code=400, message=failed to bind field value to BindUnmarshaler interface, err=parsing time \"nope\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"nope\" as \"2006\", field=param",
 		},
 	}
 
@@ -2187,11 +2190,193 @@ func TestValueBinder_BindUnmarshaler(t *testing.T) {
 	}
 }
 
+func TestValueBinder_JSONUnmarshaler(t *testing.T) {
+	example := big.NewInt(999)
+
+	var testCases = []struct {
+		name            string
+		whenURL         string
+		expectError     string
+		expectValue     big.Int
+		givenBindErrors []error
+		givenFailFast   bool
+		whenMust        bool
+	}{
+		{
+			name:        "ok, binds value",
+			whenURL:     "/search?param=999&param=998",
+			expectValue: *example,
+		},
+		{
+			name:        "ok, params values empty, value is not changed",
+			whenURL:     "/search?nope=1",
+			expectValue: big.Int{},
+		},
+		{
+			name:          "nok, previous errors fail fast without binding value",
+			givenFailFast: true,
+			whenURL:       "/search?param=1&param=100",
+			expectValue:   big.Int{},
+			expectError:   "previous error",
+		},
+		{
+			name:        "nok, conversion fails, value is not changed",
+			whenURL:     "/search?param=nope&param=xxx",
+			expectValue: big.Int{},
+			expectError: "code=400, message=failed to bind field value to json.Unmarshaler interface, err=math/big: cannot unmarshal \"nope\" into a *big.Int, field=param",
+		},
+		{
+			name:        "ok (must), binds value",
+			whenMust:    true,
+			whenURL:     "/search?param=999&param=998",
+			expectValue: *example,
+		},
+		{
+			name:        "ok (must), params values empty, returns error, value is not changed",
+			whenMust:    true,
+			whenURL:     "/search?nope=1",
+			expectValue: big.Int{},
+			expectError: "code=400, message=required field value is empty, field=param",
+		},
+		{
+			name:          "nok (must), previous errors fail fast without binding value",
+			givenFailFast: true,
+			whenMust:      true,
+			whenURL:       "/search?param=1&param=xxx",
+			expectValue:   big.Int{},
+			expectError:   "previous error",
+		},
+		{
+			name:        "nok (must), conversion fails, value is not changed",
+			whenMust:    true,
+			whenURL:     "/search?param=nope&param=xxx",
+			expectValue: big.Int{},
+			expectError: "code=400, message=failed to bind field value to json.Unmarshaler interface, err=math/big: cannot unmarshal \"nope\" into a *big.Int, field=param",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := createTestContext(tc.whenURL, nil, nil)
+			b := QueryParamsBinder(c).FailFast(tc.givenFailFast)
+			if tc.givenFailFast {
+				b.errors = []error{errors.New("previous error")}
+			}
+
+			var dest big.Int
+			var err error
+			if tc.whenMust {
+				err = b.MustJSONUnmarshaler("param", &dest).BindError()
+			} else {
+				err = b.JSONUnmarshaler("param", &dest).BindError()
+			}
+
+			assert.Equal(t, tc.expectValue, dest)
+			if tc.expectError != "" {
+				assert.EqualError(t, err, tc.expectError)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValueBinder_TextUnmarshaler(t *testing.T) {
+	example := big.NewInt(999)
+
+	var testCases = []struct {
+		name            string
+		whenURL         string
+		expectError     string
+		expectValue     big.Int
+		givenBindErrors []error
+		givenFailFast   bool
+		whenMust        bool
+	}{
+		{
+			name:        "ok, binds value",
+			whenURL:     "/search?param=999&param=998",
+			expectValue: *example,
+		},
+		{
+			name:        "ok, params values empty, value is not changed",
+			whenURL:     "/search?nope=1",
+			expectValue: big.Int{},
+		},
+		{
+			name:          "nok, previous errors fail fast without binding value",
+			givenFailFast: true,
+			whenURL:       "/search?param=1&param=100",
+			expectValue:   big.Int{},
+			expectError:   "previous error",
+		},
+		{
+			name:        "nok, conversion fails, value is not changed",
+			whenURL:     "/search?param=nope&param=xxx",
+			expectValue: big.Int{},
+			expectError: "code=400, message=failed to bind field value to encoding.TextUnmarshaler interface, err=math/big: cannot unmarshal \"nope\" into a *big.Int, field=param",
+		},
+		{
+			name:        "ok (must), binds value",
+			whenMust:    true,
+			whenURL:     "/search?param=999&param=998",
+			expectValue: *example,
+		},
+		{
+			name:        "ok (must), params values empty, returns error, value is not changed",
+			whenMust:    true,
+			whenURL:     "/search?nope=1",
+			expectValue: big.Int{},
+			expectError: "code=400, message=required field value is empty, field=param",
+		},
+		{
+			name:          "nok (must), previous errors fail fast without binding value",
+			givenFailFast: true,
+			whenMust:      true,
+			whenURL:       "/search?param=1&param=xxx",
+			expectValue:   big.Int{},
+			expectError:   "previous error",
+		},
+		{
+			name:        "nok (must), conversion fails, value is not changed",
+			whenMust:    true,
+			whenURL:     "/search?param=nope&param=xxx",
+			expectValue: big.Int{},
+			expectError: "code=400, message=failed to bind field value to encoding.TextUnmarshaler interface, err=math/big: cannot unmarshal \"nope\" into a *big.Int, field=param",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := createTestContext(tc.whenURL, nil, nil)
+			b := QueryParamsBinder(c).FailFast(tc.givenFailFast)
+			if tc.givenFailFast {
+				b.errors = []error{errors.New("previous error")}
+			}
+
+			var dest big.Int
+			var err error
+			if tc.whenMust {
+				err = b.MustTextUnmarshaler("param", &dest).BindError()
+			} else {
+				err = b.TextUnmarshaler("param", &dest).BindError()
+			}
+
+			assert.Equal(t, tc.expectValue, dest)
+			if tc.expectError != "" {
+				assert.EqualError(t, err, tc.expectError)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestValueBinder_BindWithDelimiter_types(t *testing.T) {
 	var testCases = []struct {
+		expect  any
 		name    string
 		whenURL string
-		expect  interface{}
 	}{
 		{
 			name:   "ok, strings",
@@ -2337,12 +2522,12 @@ func TestValueBinder_BindWithDelimiter_types(t *testing.T) {
 func TestValueBinder_BindWithDelimiter(t *testing.T) {
 	var testCases = []struct {
 		name            string
-		givenFailFast   bool
-		givenBindErrors []error
 		whenURL         string
-		whenMust        bool
-		expectValue     []int64
 		expectError     string
+		givenBindErrors []error
+		expectValue     []int64
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value",
@@ -2365,7 +2550,7 @@ func TestValueBinder_BindWithDelimiter(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: []int64(nil),
-			expectError: "code=400, message=failed to bind field value to int64, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to int64, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -2393,7 +2578,7 @@ func TestValueBinder_BindWithDelimiter(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: []int64(nil),
-			expectError: "code=400, message=failed to bind field value to int64, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to int64, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -2436,13 +2621,13 @@ func TestBindWithDelimiter_invalidType(t *testing.T) {
 func TestValueBinder_UnixTime(t *testing.T) {
 	exampleTime, _ := time.Parse(time.RFC3339, "2020-12-28T18:36:43+00:00") // => 1609180603
 	var testCases = []struct {
-		name            string
-		givenFailFast   bool
-		givenBindErrors []error
-		whenURL         string
-		whenMust        bool
 		expectValue     time.Time
+		name            string
+		whenURL         string
 		expectError     string
+		givenBindErrors []error
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value, unix time in seconds",
@@ -2470,7 +2655,7 @@ func TestValueBinder_UnixTime(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: time.Time{},
-			expectError: "code=400, message=failed to bind field value to Time, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to Time, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -2498,7 +2683,7 @@ func TestValueBinder_UnixTime(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: time.Time{},
-			expectError: "code=400, message=failed to bind field value to Time, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to Time, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -2529,18 +2714,109 @@ func TestValueBinder_UnixTime(t *testing.T) {
 	}
 }
 
+func TestValueBinder_UnixTimeMilli(t *testing.T) {
+	exampleTime, _ := time.Parse(time.RFC3339Nano, "2022-03-13T15:13:30.140000000+00:00") // => 1647184410140
+	var testCases = []struct {
+		expectValue     time.Time
+		name            string
+		whenURL         string
+		expectError     string
+		givenBindErrors []error
+		givenFailFast   bool
+		whenMust        bool
+	}{
+		{
+			name:        "ok, binds value, unix time in milliseconds",
+			whenURL:     "/search?param=1647184410140&param=1647184410199",
+			expectValue: exampleTime,
+		},
+		{
+			name:        "ok, params values empty, value is not changed",
+			whenURL:     "/search?nope=1",
+			expectValue: time.Time{},
+		},
+		{
+			name:          "nok, previous errors fail fast without binding value",
+			givenFailFast: true,
+			whenURL:       "/search?param=1&param=100",
+			expectValue:   time.Time{},
+			expectError:   "previous error",
+		},
+		{
+			name:        "nok, conversion fails, value is not changed",
+			whenURL:     "/search?param=nope&param=100",
+			expectValue: time.Time{},
+			expectError: "code=400, message=failed to bind field value to Time, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+		},
+		{
+			name:        "ok (must), binds value",
+			whenMust:    true,
+			whenURL:     "/search?param=1647184410140&param=1647184410199",
+			expectValue: exampleTime,
+		},
+		{
+			name:        "ok (must), params values empty, returns error, value is not changed",
+			whenMust:    true,
+			whenURL:     "/search?nope=1",
+			expectValue: time.Time{},
+			expectError: "code=400, message=required field value is empty, field=param",
+		},
+		{
+			name:          "nok (must), previous errors fail fast without binding value",
+			givenFailFast: true,
+			whenMust:      true,
+			whenURL:       "/search?param=1&param=100",
+			expectValue:   time.Time{},
+			expectError:   "previous error",
+		},
+		{
+			name:        "nok (must), conversion fails, value is not changed",
+			whenMust:    true,
+			whenURL:     "/search?param=nope&param=100",
+			expectValue: time.Time{},
+			expectError: "code=400, message=failed to bind field value to Time, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := createTestContext(tc.whenURL, nil, nil)
+			b := QueryParamsBinder(c).FailFast(tc.givenFailFast)
+			if tc.givenFailFast {
+				b.errors = []error{errors.New("previous error")}
+			}
+
+			dest := time.Time{}
+			var err error
+			if tc.whenMust {
+				err = b.MustUnixTimeMilli("param", &dest).BindError()
+			} else {
+				err = b.UnixTimeMilli("param", &dest).BindError()
+			}
+
+			assert.Equal(t, tc.expectValue.UnixNano(), dest.UnixNano())
+			assert.Equal(t, tc.expectValue.In(time.UTC), dest.In(time.UTC))
+			if tc.expectError != "" {
+				assert.EqualError(t, err, tc.expectError)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestValueBinder_UnixTimeNano(t *testing.T) {
 	exampleTime, _ := time.Parse(time.RFC3339, "2020-12-28T18:36:43.000000000+00:00")         // => 1609180603
 	exampleTimeNano, _ := time.Parse(time.RFC3339Nano, "2020-12-28T18:36:43.123456789+00:00") // => 1609180603123456789
 	exampleTimeNanoBelowSec, _ := time.Parse(time.RFC3339Nano, "1970-01-01T00:00:00.999999999+00:00")
 	var testCases = []struct {
-		name            string
-		givenFailFast   bool
-		givenBindErrors []error
-		whenURL         string
-		whenMust        bool
 		expectValue     time.Time
+		name            string
+		whenURL         string
 		expectError     string
+		givenBindErrors []error
+		givenFailFast   bool
+		whenMust        bool
 	}{
 		{
 			name:        "ok, binds value, unix time in nano seconds (sec precision)",
@@ -2573,7 +2849,7 @@ func TestValueBinder_UnixTimeNano(t *testing.T) {
 			name:        "nok, conversion fails, value is not changed",
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: time.Time{},
-			expectError: "code=400, message=failed to bind field value to Time, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to Time, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
 		},
 		{
 			name:        "ok (must), binds value",
@@ -2601,7 +2877,7 @@ func TestValueBinder_UnixTimeNano(t *testing.T) {
 			whenMust:    true,
 			whenURL:     "/search?param=nope&param=100",
 			expectValue: time.Time{},
-			expectError: "code=400, message=failed to bind field value to Time, internal=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
+			expectError: "code=400, message=failed to bind field value to Time, err=strconv.ParseInt: parsing \"nope\": invalid syntax, field=param",
 		},
 	}
 
@@ -2643,7 +2919,7 @@ func BenchmarkDefaultBinder_BindInt64_single(b *testing.B) {
 	binder := new(DefaultBinder)
 	for i := 0; i < b.N; i++ {
 		var dest Opts
-		_ = binder.Bind(&dest, c)
+		_ = binder.Bind(c, &dest)
 	}
 }
 
@@ -2691,17 +2967,16 @@ func BenchmarkRawFunc_Int64_single(b *testing.B) {
 
 func BenchmarkDefaultBinder_BindInt64_10_fields(b *testing.B) {
 	type Opts struct {
-		Int64  int64  `query:"int64"`
-		Int32  int32  `query:"int32"`
-		Int16  int16  `query:"int16"`
-		Int8   int8   `query:"int8"`
-		String string `query:"string"`
-
-		Uint64  uint64   `query:"uint64"`
-		Uint32  uint32   `query:"uint32"`
-		Uint16  uint16   `query:"uint16"`
-		Uint8   uint8    `query:"uint8"`
+		String  string   `query:"string"`
 		Strings []string `query:"strings"`
+		Int64   int64    `query:"int64"`
+		Uint64  uint64   `query:"uint64"`
+		Int32   int32    `query:"int32"`
+		Uint32  uint32   `query:"uint32"`
+		Int16   int16    `query:"int16"`
+		Uint16  uint16   `query:"uint16"`
+		Int8    int8     `query:"int8"`
+		Uint8   uint8    `query:"uint8"`
 	}
 	c := createTestContext("/search?int64=1&int32=2&int16=3&int8=4&string=test&uint64=5&uint32=6&uint16=7&uint8=8&strings=first&strings=second", nil, nil)
 
@@ -2710,7 +2985,7 @@ func BenchmarkDefaultBinder_BindInt64_10_fields(b *testing.B) {
 	binder := new(DefaultBinder)
 	for i := 0; i < b.N; i++ {
 		var dest Opts
-		_ = binder.Bind(&dest, c)
+		_ = binder.Bind(c, &dest)
 		if dest.Int64 != 1 {
 			b.Fatalf("int64!=1")
 		}
@@ -2719,17 +2994,16 @@ func BenchmarkDefaultBinder_BindInt64_10_fields(b *testing.B) {
 
 func BenchmarkValueBinder_BindInt64_10_fields(b *testing.B) {
 	type Opts struct {
-		Int64  int64  `query:"int64"`
-		Int32  int32  `query:"int32"`
-		Int16  int16  `query:"int16"`
-		Int8   int8   `query:"int8"`
-		String string `query:"string"`
-
-		Uint64  uint64   `query:"uint64"`
-		Uint32  uint32   `query:"uint32"`
-		Uint16  uint16   `query:"uint16"`
-		Uint8   uint8    `query:"uint8"`
+		String  string   `query:"string"`
 		Strings []string `query:"strings"`
+		Int64   int64    `query:"int64"`
+		Uint64  uint64   `query:"uint64"`
+		Int32   int32    `query:"int32"`
+		Uint32  uint32   `query:"uint32"`
+		Int16   int16    `query:"int16"`
+		Uint16  uint16   `query:"uint16"`
+		Int8    int8     `query:"int8"`
+		Uint8   uint8    `query:"uint8"`
 	}
 	c := createTestContext("/search?int64=1&int32=2&int16=3&int8=4&string=test&uint64=5&uint32=6&uint16=7&uint8=8&strings=first&strings=second", nil, nil)
 
@@ -2753,5 +3027,226 @@ func BenchmarkValueBinder_BindInt64_10_fields(b *testing.B) {
 		if dest.Int64 != 1 {
 			b.Fatalf("int64!=1")
 		}
+	}
+}
+
+func TestValueBinder_TimeError(t *testing.T) {
+	var testCases = []struct {
+		expectValue     time.Time
+		name            string
+		whenURL         string
+		whenLayout      string
+		expectError     string
+		givenBindErrors []error
+		givenFailFast   bool
+		whenMust        bool
+	}{
+		{
+			name:        "nok, conversion fails, value is not changed",
+			whenURL:     "/search?param=nope&param=100",
+			expectValue: time.Time{},
+			expectError: "code=400, message=failed to bind field value to Time, err=parsing time \"nope\": extra text: \"nope\", field=param",
+		},
+		{
+			name:        "nok (must), conversion fails, value is not changed",
+			whenMust:    true,
+			whenURL:     "/search?param=nope&param=100",
+			expectValue: time.Time{},
+			expectError: "code=400, message=failed to bind field value to Time, err=parsing time \"nope\": extra text: \"nope\", field=param",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := createTestContext(tc.whenURL, nil, nil)
+			b := QueryParamsBinder(c).FailFast(tc.givenFailFast)
+			if tc.givenFailFast {
+				b.errors = []error{errors.New("previous error")}
+			}
+
+			dest := time.Time{}
+			var err error
+			if tc.whenMust {
+				err = b.MustTime("param", &dest, tc.whenLayout).BindError()
+			} else {
+				err = b.Time("param", &dest, tc.whenLayout).BindError()
+			}
+
+			assert.Equal(t, tc.expectValue, dest)
+			if tc.expectError != "" {
+				assert.EqualError(t, err, tc.expectError)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValueBinder_TimesError(t *testing.T) {
+	var testCases = []struct {
+		name            string
+		whenURL         string
+		whenLayout      string
+		expectError     string
+		givenBindErrors []error
+		expectValue     []time.Time
+		givenFailFast   bool
+		whenMust        bool
+	}{
+		{
+			name:          "nok, fail fast without binding value",
+			givenFailFast: true,
+			whenURL:       "/search?param=1&param=100",
+			expectValue:   []time.Time(nil),
+			expectError:   "code=400, message=failed to bind field value to Time, err=parsing time \"1\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"1\" as \"2006\", field=param",
+		},
+		{
+			name:        "nok, conversion fails, value is not changed",
+			whenURL:     "/search?param=nope&param=100",
+			expectValue: []time.Time(nil),
+			expectError: "code=400, message=failed to bind field value to Time, err=parsing time \"nope\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"nope\" as \"2006\", field=param",
+		},
+		{
+			name:        "nok (must), conversion fails, value is not changed",
+			whenMust:    true,
+			whenURL:     "/search?param=nope&param=100",
+			expectValue: []time.Time(nil),
+			expectError: "code=400, message=failed to bind field value to Time, err=parsing time \"nope\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"nope\" as \"2006\", field=param",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := createTestContext(tc.whenURL, nil, nil)
+			b := QueryParamsBinder(c).FailFast(tc.givenFailFast)
+			b.errors = tc.givenBindErrors
+
+			layout := time.RFC3339
+			if tc.whenLayout != "" {
+				layout = tc.whenLayout
+			}
+
+			var dest []time.Time
+			var err error
+			if tc.whenMust {
+				err = b.MustTimes("param", &dest, layout).BindError()
+			} else {
+				err = b.Times("param", &dest, layout).BindError()
+			}
+
+			assert.Equal(t, tc.expectValue, dest)
+			if tc.expectError != "" {
+				assert.EqualError(t, err, tc.expectError)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValueBinder_DurationError(t *testing.T) {
+	var testCases = []struct {
+		name            string
+		whenURL         string
+		expectError     string
+		givenBindErrors []error
+		expectValue     time.Duration
+		givenFailFast   bool
+		whenMust        bool
+	}{
+		{
+			name:        "nok, conversion fails, value is not changed",
+			whenURL:     "/search?param=nope&param=100",
+			expectValue: 0,
+			expectError: "code=400, message=failed to bind field value to Duration, err=time: invalid duration \"nope\", field=param",
+		},
+		{
+			name:        "nok (must), conversion fails, value is not changed",
+			whenMust:    true,
+			whenURL:     "/search?param=nope&param=100",
+			expectValue: 0,
+			expectError: "code=400, message=failed to bind field value to Duration, err=time: invalid duration \"nope\", field=param",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := createTestContext(tc.whenURL, nil, nil)
+			b := QueryParamsBinder(c).FailFast(tc.givenFailFast)
+			if tc.givenFailFast {
+				b.errors = []error{errors.New("previous error")}
+			}
+
+			var dest time.Duration
+			var err error
+			if tc.whenMust {
+				err = b.MustDuration("param", &dest).BindError()
+			} else {
+				err = b.Duration("param", &dest).BindError()
+			}
+
+			assert.Equal(t, tc.expectValue, dest)
+			if tc.expectError != "" {
+				assert.EqualError(t, err, tc.expectError)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValueBinder_DurationsError(t *testing.T) {
+	var testCases = []struct {
+		name            string
+		whenURL         string
+		expectError     string
+		givenBindErrors []error
+		expectValue     []time.Duration
+		givenFailFast   bool
+		whenMust        bool
+	}{
+		{
+			name:          "nok, fail fast without binding value",
+			givenFailFast: true,
+			whenURL:       "/search?param=1&param=100",
+			expectValue:   []time.Duration(nil),
+			expectError:   "code=400, message=failed to bind field value to Duration, err=time: missing unit in duration \"1\", field=param",
+		},
+		{
+			name:        "nok, conversion fails, value is not changed",
+			whenURL:     "/search?param=nope&param=100",
+			expectValue: []time.Duration(nil),
+			expectError: "code=400, message=failed to bind field value to Duration, err=time: invalid duration \"nope\", field=param",
+		},
+		{
+			name:        "nok (must), conversion fails, value is not changed",
+			whenMust:    true,
+			whenURL:     "/search?param=nope&param=100",
+			expectValue: []time.Duration(nil),
+			expectError: "code=400, message=failed to bind field value to Duration, err=time: invalid duration \"nope\", field=param",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := createTestContext(tc.whenURL, nil, nil)
+			b := QueryParamsBinder(c).FailFast(tc.givenFailFast)
+			b.errors = tc.givenBindErrors
+
+			var dest []time.Duration
+			var err error
+			if tc.whenMust {
+				err = b.MustDurations("param", &dest).BindError()
+			} else {
+				err = b.Durations("param", &dest).BindError()
+			}
+
+			assert.Equal(t, tc.expectValue, dest)
+			if tc.expectError != "" {
+				assert.EqualError(t, err, tc.expectError)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
 	}
 }

@@ -1,33 +1,36 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: © 2015 LabStack LLC and Echo contributors
+
 package echo
 
 import (
 	"bytes"
 	stdContext "context"
-	"crypto/tls"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"reflect"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/http2"
 )
 
-type (
-	user struct {
-		ID   int    `json:"id" xml:"id" form:"id" query:"id" param:"id"`
-		Name string `json:"name" xml:"name" form:"name" query:"name" param:"name"`
-	}
-)
+type user struct {
+	ID   int    `json:"id" xml:"id" form:"id" query:"id" param:"id" header:"id"`
+	Name string `json:"name" xml:"name" form:"name" query:"name" param:"name" header:"name"`
+}
 
 const (
 	userJSON                    = `{"id":1,"name":"Jon Snow"}`
@@ -61,25 +64,105 @@ func TestEcho(t *testing.T) {
 	// Router
 	assert.NotNil(t, e.Router())
 
-	// DefaultHTTPErrorHandler
-	e.DefaultHTTPErrorHandler(errors.New("error"), c)
+	e.HTTPErrorHandler(c, errors.New("error"))
+
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
 
-func TestEchoStatic(t *testing.T) {
+func TestNewWithConfig(t *testing.T) {
+	e := NewWithConfig(Config{})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+
+	e.GET("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "Hello, World!")
+	})
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusTeapot, rec.Code)
+	assert.Equal(t, `Hello, World!`, rec.Body.String())
+}
+
+func TestNewDefaultFS(t *testing.T) {
+	tempDir := t.TempDir()
+	filename := filepath.Join(tempDir, "file.txt")
+	if err := os.WriteFile(filename, []byte("hello"), 0644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
 	var testCases = []struct {
-		name                 string
-		givenPrefix          string
-		givenRoot            string
-		whenURL              string
-		expectStatus         int
-		expectHeaderLocation string
-		expectBodyStartsWith string
+		name          string
+		givenDir      string
+		whenName      string
+		expectedError string
+	}{
+		{
+			name:     "ok, can open absolute path",
+			givenDir: tempDir,
+			whenName: filename,
+		},
+		{
+			name:     "ok, can open path to fs",
+			givenDir: tempDir,
+			whenName: "file.txt",
+		},
+		{
+			name:          "nok, can not use ./ in path",
+			givenDir:      tempDir,
+			whenName:      "./file.txt",
+			expectedError: `open ./file.txt: invalid argument`,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			myFs := NewDefaultFS(tc.givenDir)
+
+			f, err := myFs.Open(tc.whenName)
+			if tc.expectedError != "" {
+				assert.EqualError(t, err, tc.expectedError)
+				return
+			}
+			if err != nil {
+				t.Fatalf("failed to read file: %v", err)
+			}
+			defer f.Close()
+
+			contents, err := io.ReadAll(f)
+			assert.NoError(t, err)
+			assert.Equal(t, []byte("hello"), contents)
+		})
+	}
+}
+
+func TestEcho_StaticFS(t *testing.T) {
+	dotsInFilenameFS := fstest.MapFS{
+		// On Windows filename `%2f..` can not be created but in Linux it is possible.
+		"%2f..": {Data: []byte("This filename is escaped to `/..` in URL.Path")},
+	}
+
+	var testCases = []struct {
+		givenFs                              fs.FS
+		name                                 string
+		givenPrefix                          string
+		givenFsRoot                          string
+		givenEnablePathUnescapingStaticFiles bool
+		whenURL                              string
+		expectHeaderLocation                 string
+		expectBodyStartsWith                 string
+		expectStatus                         int
 	}{
 		{
 			name:                 "ok",
 			givenPrefix:          "/images",
-			givenRoot:            "_fixture/images",
+			givenFs:              os.DirFS("./_fixture/images"),
+			whenURL:              "/images/walle.png",
+			expectStatus:         http.StatusOK,
+			expectBodyStartsWith: string([]byte{0x89, 0x50, 0x4e, 0x47}),
+		},
+		{
+			name:                 "ok, from sub fs",
+			givenPrefix:          "/images",
+			givenFs:              MustSubFS(os.DirFS("./_fixture/"), "images"),
 			whenURL:              "/images/walle.png",
 			expectStatus:         http.StatusOK,
 			expectBodyStartsWith: string([]byte{0x89, 0x50, 0x4e, 0x47}),
@@ -87,7 +170,7 @@ func TestEchoStatic(t *testing.T) {
 		{
 			name:                 "No file",
 			givenPrefix:          "/images",
-			givenRoot:            "_fixture/scripts",
+			givenFs:              os.DirFS("_fixture/scripts"),
 			whenURL:              "/images/bolt.png",
 			expectStatus:         http.StatusNotFound,
 			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
@@ -95,7 +178,7 @@ func TestEchoStatic(t *testing.T) {
 		{
 			name:                 "Directory",
 			givenPrefix:          "/images",
-			givenRoot:            "_fixture/images",
+			givenFs:              os.DirFS("_fixture/images"),
 			whenURL:              "/images/",
 			expectStatus:         http.StatusNotFound,
 			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
@@ -103,7 +186,7 @@ func TestEchoStatic(t *testing.T) {
 		{
 			name:                 "Directory Redirect",
 			givenPrefix:          "/",
-			givenRoot:            "_fixture",
+			givenFs:              os.DirFS("_fixture/"),
 			whenURL:              "/folder",
 			expectStatus:         http.StatusMovedPermanently,
 			expectHeaderLocation: "/folder/",
@@ -112,7 +195,7 @@ func TestEchoStatic(t *testing.T) {
 		{
 			name:                 "Directory Redirect with non-root path",
 			givenPrefix:          "/static",
-			givenRoot:            "_fixture",
+			givenFs:              os.DirFS("_fixture"),
 			whenURL:              "/static",
 			expectStatus:         http.StatusMovedPermanently,
 			expectHeaderLocation: "/static/",
@@ -121,7 +204,7 @@ func TestEchoStatic(t *testing.T) {
 		{
 			name:                 "Prefixed directory 404 (request URL without slash)",
 			givenPrefix:          "/folder/", // trailing slash will intentionally not match "/folder"
-			givenRoot:            "_fixture",
+			givenFs:              os.DirFS("_fixture"),
 			whenURL:              "/folder", // no trailing slash
 			expectStatus:         http.StatusNotFound,
 			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
@@ -129,7 +212,7 @@ func TestEchoStatic(t *testing.T) {
 		{
 			name:                 "Prefixed directory redirect (without slash redirect to slash)",
 			givenPrefix:          "/folder", // no trailing slash shall match /folder and /folder/*
-			givenRoot:            "_fixture",
+			givenFs:              os.DirFS("_fixture"),
 			whenURL:              "/folder", // no trailing slash
 			expectStatus:         http.StatusMovedPermanently,
 			expectHeaderLocation: "/folder/",
@@ -138,7 +221,7 @@ func TestEchoStatic(t *testing.T) {
 		{
 			name:                 "Directory with index.html",
 			givenPrefix:          "/",
-			givenRoot:            "_fixture",
+			givenFs:              os.DirFS("_fixture"),
 			whenURL:              "/",
 			expectStatus:         http.StatusOK,
 			expectBodyStartsWith: "<!doctype html>",
@@ -146,7 +229,7 @@ func TestEchoStatic(t *testing.T) {
 		{
 			name:                 "Prefixed directory with index.html (prefix ending with slash)",
 			givenPrefix:          "/assets/",
-			givenRoot:            "_fixture",
+			givenFs:              os.DirFS("_fixture"),
 			whenURL:              "/assets/",
 			expectStatus:         http.StatusOK,
 			expectBodyStartsWith: "<!doctype html>",
@@ -154,7 +237,7 @@ func TestEchoStatic(t *testing.T) {
 		{
 			name:                 "Prefixed directory with index.html (prefix ending without slash)",
 			givenPrefix:          "/assets",
-			givenRoot:            "_fixture",
+			givenFs:              os.DirFS("_fixture"),
 			whenURL:              "/assets/",
 			expectStatus:         http.StatusOK,
 			expectBodyStartsWith: "<!doctype html>",
@@ -162,7 +245,7 @@ func TestEchoStatic(t *testing.T) {
 		{
 			name:                 "Sub-directory with index.html",
 			givenPrefix:          "/",
-			givenRoot:            "_fixture",
+			givenFs:              os.DirFS("_fixture"),
 			whenURL:              "/folder/",
 			expectStatus:         http.StatusOK,
 			expectBodyStartsWith: "<!doctype html>",
@@ -170,28 +253,103 @@ func TestEchoStatic(t *testing.T) {
 		{
 			name:                 "do not allow directory traversal (backslash - windows separator)",
 			givenPrefix:          "/",
-			givenRoot:            "_fixture/",
+			givenFs:              os.DirFS("_fixture/"),
 			whenURL:              `/..\\middleware/basic_auth.go`,
 			expectStatus:         http.StatusNotFound,
 			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
 		},
 		{
+			name:                                 "do not accept encoded dots in path (%2E%2E is `..`) to traverse within filesystem boundary",
+			givenPrefix:                          "/",
+			givenFs:                              os.DirFS("_fixture/"),
+			givenEnablePathUnescapingStaticFiles: false,
+			whenURL:                              `/dist/public/%2E%2E/private.txt`, // `/dist/public/../private.txt`
+			expectStatus:                         http.StatusNotFound,
+			expectBodyStartsWith:                 "{\"message\":\"Not Found\"}\n",
+		},
+		{
+			name:                                 "nok, encoded dots (%2E%2E is `..`) are rejected after unescaping (GHSA-3pmx-cf9f-34xr)",
+			givenPrefix:                          "/",
+			givenFs:                              os.DirFS("_fixture/"),
+			givenEnablePathUnescapingStaticFiles: true,
+			whenURL:                              `/dist/public/%2E%2E/private.txt`, // `/dist/public/../private.txt`
+			expectStatus:                         http.StatusNotFound,
+			expectBodyStartsWith:                 "{\"message\":\"Not Found\"}\n",
+		},
+		{
+			name:                                 "ok, file with space in name is served when path unescaping is enabled",
+			givenPrefix:                          "/",
+			givenFs:                              os.DirFS("_fixture/dist/public"),
+			givenEnablePathUnescapingStaticFiles: true,
+			whenURL:                              "/hello%20world.txt",
+			expectStatus:                         http.StatusOK,
+			expectBodyStartsWith:                 "hello world file",
+		},
+		{
 			name:                 "do not allow directory traversal (slash - unix separator)",
 			givenPrefix:          "/",
-			givenRoot:            "_fixture/",
+			givenFs:              os.DirFS("_fixture/"),
 			whenURL:              `/../middleware/basic_auth.go`,
 			expectStatus:         http.StatusNotFound,
 			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
+		},
+		{
+			name:                 "do not unescape path variables by default",
+			givenPrefix:          "/",
+			givenFs:              os.DirFS("_fixture/"),
+			whenURL:              "/open.redirect.hackercom%2f..",
+			expectStatus:         http.StatusNotFound,
+			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
+		},
+		{
+			name:                                 "no open redirect when unescaping path variables in static handler",
+			givenPrefix:                          "/",
+			givenFs:                              os.DirFS("_fixture/"),
+			givenEnablePathUnescapingStaticFiles: true,
+			// `//open.redirect.hackercom/..` has empty and `..` segments after unescaping, so it is not served (and not
+			// redirected to a location starting with `//`)
+			whenURL:              "/%2fopen.redirect.hackercom%2f..",
+			expectStatus:         http.StatusNotFound,
+			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
+		},
+		{
+			name:                                 "reject an encoded filename alias whose decoded path has empty and dot segments",
+			givenPrefix:                          "/",
+			givenFs:                              dotsInFilenameFS,
+			givenEnablePathUnescapingStaticFiles: false,
+			whenURL:                              "/%2f..",
+			expectStatus:                         http.StatusNotFound,
+			expectHeaderLocation:                 "",
+			expectBodyStartsWith:                 "{\"message\":\"Not Found\"}\n",
+		},
+		{
+			name:                                 "serve a percent-containing filename when the percent sign is correctly escaped",
+			givenPrefix:                          "/",
+			givenFs:                              dotsInFilenameFS,
+			givenEnablePathUnescapingStaticFiles: false,
+			whenURL:                              "/%252f..",
+			expectStatus:                         http.StatusOK,
+			expectBodyStartsWith:                 "This filename is escaped to `/..` in URL.Path",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			e := New()
-			e.Static(tc.givenPrefix, tc.givenRoot)
+			e := NewWithConfig(Config{
+				EnablePathUnescapingStaticFiles: tc.givenEnablePathUnescapingStaticFiles,
+			})
+
+			tmpFs := tc.givenFs
+			if tc.givenFsRoot != "" {
+				tmpFs = MustSubFS(tmpFs, tc.givenFsRoot)
+			}
+			e.StaticFS(tc.givenPrefix, tmpFs)
+
 			req := httptest.NewRequest(http.MethodGet, tc.whenURL, nil)
 			rec := httptest.NewRecorder()
+
 			e.ServeHTTP(rec, req)
+
 			assert.Equal(t, tc.expectStatus, rec.Code)
 			body := rec.Body.String()
 			if tc.expectBodyStartsWith != "" {
@@ -210,46 +368,300 @@ func TestEchoStatic(t *testing.T) {
 	}
 }
 
-func TestEchoStaticRedirectIndex(t *testing.T) {
-	assert := assert.New(t)
-	e := New()
-
-	// HandlerFunc
-	e.Static("/static", "_fixture")
-
-	errCh := make(chan error)
-
-	go func() {
-		errCh <- e.Start("127.0.0.1:1323")
-	}()
-
-	time.Sleep(200 * time.Millisecond)
-
-	if resp, err := http.Get("http://127.0.0.1:1323/static"); err == nil {
-		defer resp.Body.Close()
-		assert.Equal(http.StatusOK, resp.StatusCode)
-
-		if body, err := ioutil.ReadAll(resp.Body); err == nil {
-			assert.Equal(true, strings.HasPrefix(string(body), "<!doctype html>"))
-		} else {
-			assert.Fail(err.Error())
-		}
-
-	} else {
-		assert.Fail(err.Error())
+func TestStaticDirectoryHandlerAndRouterInconsistentEscaping(t *testing.T) {
+	var testCases = []struct {
+		name                                 string
+		givenEnablePathUnescapingStaticFiles bool
+		givenRouterUnescapePathParamValues   bool
+		givenRouterUseEscapedPathForMatching bool
+		whenURL                              string
+		expectBody                           string
+		expectStatus                         int
+	}{
+		{
+			name:                                 "ok, file is served from not-forbidden path",
+			givenEnablePathUnescapingStaticFiles: false,
+			whenURL:                              "/test.txt",
+			expectBody:                           "test.txt contents",
+			expectStatus:                         http.StatusOK,
+		},
+		{
+			name:                                 "ok, forbidden path is matched by route wildcard and forbidden by that",
+			givenEnablePathUnescapingStaticFiles: false,
+			whenURL:                              "/admin/private.txt",
+			expectBody:                           "{\"message\":\"Forbidden\"}",
+			expectStatus:                         http.StatusForbidden,
+		},
+		{
+			name:                                 "ok, escaped filename from forbidden path is routed to guarded route",
+			givenEnablePathUnescapingStaticFiles: false,
+			givenRouterUnescapePathParamValues:   false,
+			givenRouterUseEscapedPathForMatching: true, // Router uses escaped path (req.URL.RawPath) for matching
+			whenURL:                              "/admin%2fprivate.txt",
+			expectBody:                           "{\"message\":\"Forbidden\"}",
+			expectStatus:                         http.StatusForbidden,
+		},
+		{
+			name:                                 "ok, escaped filename from forbidden path is not unescaped and results 404",
+			givenEnablePathUnescapingStaticFiles: false, // router path escaping and StaticDirectoryHandler is consistent
+			whenURL:                              "/admin%2fprivate.txt",
+			expectBody:                           "{\"message\":\"Not Found\"}",
+			expectStatus:                         http.StatusNotFound,
+		},
+		{
+			name:                                 "nok, escaped filename from forbidden path is unescaped and returns file contents (handler unescapes)",
+			givenEnablePathUnescapingStaticFiles: true, // router path escaping and StaticDirectoryHandler is NOT consistent
+			givenRouterUnescapePathParamValues:   false,
+			whenURL:                              "/admin%2fprivate.txt",
+			expectBody:                           "public/admin/private.txt - private file",
+			expectStatus:                         http.StatusOK,
+		},
+		{
+			name:                                 "nok, escaped filename from forbidden path is unescaped and returns file contents (router unescapes)",
+			givenEnablePathUnescapingStaticFiles: false,
+			givenRouterUnescapePathParamValues:   true, // router path escaping and StaticDirectoryHandler is NOT consistent
+			whenURL:                              "/admin%2fprivate.txt",
+			expectBody:                           "public/admin/private.txt - private file",
+			expectStatus:                         http.StatusOK,
+		},
+		{
+			name:                                 "nok, unescaped filename from forbidden path is escaped and returns file contents (router unescapes and method unescapes)",
+			givenEnablePathUnescapingStaticFiles: true,
+			givenRouterUnescapePathParamValues:   true, // consistent path unescaping - makes no difference
+			whenURL:                              "/admin%2fprivate.txt",
+			expectBody:                           "public/admin/private.txt - private file",
+			expectStatus:                         http.StatusOK,
+		},
+		{
+			name:                                 "ok, dot segments are rejected even when router uses escaped path (GHSA-3pmx-cf9f-34xr)",
+			givenEnablePathUnescapingStaticFiles: false,
+			givenRouterUnescapePathParamValues:   false,
+			// With UseEscapedPathForMatching the router matches req.URL.Path. The file would resolve to
+			// `admin/private.txt` after path.Clean(), so paths with dot segments are not served.
+			givenRouterUseEscapedPathForMatching: true,
+			whenURL:                              "/assets/../admin%2fprivate.txt",
+			expectBody:                           `{"message":"Not Found"}`,
+			expectStatus:                         http.StatusNotFound,
+		},
+		{
+			name:         "ok, parent dot segment is rejected",
+			whenURL:      "/assets/../admin/private.txt",
+			expectBody:   `{"message":"Not Found"}`,
+			expectStatus: http.StatusNotFound,
+		},
+		{
+			name:         "ok, current dot segment is rejected",
+			whenURL:      "/./admin/private.txt",
+			expectBody:   `{"message":"Not Found"}`,
+			expectStatus: http.StatusNotFound,
+		},
+		{
+			name:         "ok, nested parent dot segments are rejected",
+			whenURL:      "/a/b/../../admin/private.txt",
+			expectBody:   `{"message":"Not Found"}`,
+			expectStatus: http.StatusNotFound,
+		},
 	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewRouter(RouterConfig{
+				UnescapePathParamValues:   tc.givenRouterUnescapePathParamValues,
+				UseEscapedPathForMatching: tc.givenRouterUseEscapedPathForMatching,
+			})
+			e := NewWithConfig(Config{
+				EnablePathUnescapingStaticFiles: tc.givenEnablePathUnescapingStaticFiles,
+				Router:                          r,
+				Filesystem:                      os.DirFS("./_fixture/dist"),
+			})
 
-	if err := e.Close(); err != nil {
-		t.Fatal(err)
+			// 0.
+			// given folder structure:
+			// private.txt
+			// public/
+			// public/index.html
+			// public/text.txt
+			// public/admin/private.txt
+
+			// 1. share `public/` folder contents from the server root. This folder actually contains subfolder `admin` which
+			// contents we want to forbid from downloading
+			e.Static("/", "public")
+
+			// 2. naively assume that everything under /admin folder is now forbidden
+			e.GET("/admin/*", func(c *Context) error {
+				return ErrForbidden
+			})
+
+			req := httptest.NewRequest(http.MethodGet, tc.whenURL, nil)
+			rec := httptest.NewRecorder()
+
+			e.ServeHTTP(rec, req)
+
+			assert.Equal(t, tc.expectStatus, rec.Code)
+			body := strings.TrimRight(rec.Body.String(), "\r\n")
+			assert.Equal(t, tc.expectBody, body)
+		})
 	}
 }
 
-func TestEchoFile(t *testing.T) {
+func TestEcho_FileFS(t *testing.T) {
+	var testCases = []struct {
+		whenFS           fs.FS
+		name             string
+		whenPath         string
+		whenFile         string
+		givenURL         string
+		expectStartsWith []byte
+		expectCode       int
+	}{
+		{
+			name:             "ok",
+			whenPath:         "/walle",
+			whenFS:           os.DirFS("_fixture/images"),
+			whenFile:         "walle.png",
+			givenURL:         "/walle",
+			expectCode:       http.StatusOK,
+			expectStartsWith: []byte{0x89, 0x50, 0x4e},
+		},
+		{
+			name:             "nok, requesting invalid path",
+			whenPath:         "/walle",
+			whenFS:           os.DirFS("_fixture/images"),
+			whenFile:         "walle.png",
+			givenURL:         "/walle.png",
+			expectCode:       http.StatusNotFound,
+			expectStartsWith: []byte(`{"message":"Not Found"}`),
+		},
+		{
+			name:             "nok, serving not existent file from filesystem",
+			whenPath:         "/walle",
+			whenFS:           os.DirFS("_fixture/images"),
+			whenFile:         "not-existent.png",
+			givenURL:         "/walle",
+			expectCode:       http.StatusNotFound,
+			expectStartsWith: []byte(`{"message":"Not Found"}`),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := New()
+			e.FileFS(tc.whenPath, tc.whenFile, tc.whenFS)
+
+			req := httptest.NewRequest(http.MethodGet, tc.givenURL, nil)
+			rec := httptest.NewRecorder()
+
+			e.ServeHTTP(rec, req)
+
+			assert.Equal(t, tc.expectCode, rec.Code)
+
+			body := rec.Body.Bytes()
+			if len(body) > len(tc.expectStartsWith) {
+				body = body[:len(tc.expectStartsWith)]
+			}
+			assert.Equal(t, tc.expectStartsWith, body)
+		})
+	}
+}
+
+func TestEcho_StaticPanic(t *testing.T) {
+	var testCases = []struct {
+		name      string
+		givenRoot string
+	}{
+		{
+			name:      "panics for ../",
+			givenRoot: "../assets",
+		},
+		{
+			name:      "panics for /",
+			givenRoot: "/assets",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := New()
+			e.Filesystem = os.DirFS("./")
+
+			assert.Panics(t, func() {
+				e.Static("../assets", tc.givenRoot)
+			})
+		})
+	}
+}
+
+func TestEchoStaticRedirectIndex(t *testing.T) {
 	e := New()
-	e.File("/walle", "_fixture/images/walle.png")
-	c, b := request(http.MethodGet, "/walle", e)
-	assert.Equal(t, http.StatusOK, c)
-	assert.NotEmpty(t, b)
+
+	// HandlerFunc
+	ri := e.Static("/static", "_fixture")
+	assert.Equal(t, http.MethodGet, ri.Method)
+	assert.Equal(t, "/static*", ri.Path)
+	assert.Equal(t, "GET:/static*", ri.Name)
+	assert.Equal(t, []string{"*"}, ri.Parameters)
+
+	ctx, cancel := stdContext.WithTimeout(stdContext.Background(), 200*time.Millisecond)
+	defer cancel()
+	addr, err := startOnRandomPort(ctx, e)
+	if err != nil {
+		assert.Fail(t, err.Error())
+	}
+
+	code, body, err := doGet(fmt.Sprintf("http://%v/static", addr))
+	assert.NoError(t, err)
+	assert.True(t, strings.HasPrefix(body, "<!doctype html>"))
+	assert.Equal(t, http.StatusOK, code)
+}
+
+func TestEchoFile(t *testing.T) {
+	var testCases = []struct {
+		name             string
+		givenPath        string
+		givenFile        string
+		whenPath         string
+		expectStartsWith string
+		expectCode       int
+	}{
+		{
+			name:             "ok",
+			givenPath:        "/walle",
+			givenFile:        "_fixture/images/walle.png",
+			whenPath:         "/walle",
+			expectCode:       http.StatusOK,
+			expectStartsWith: string([]byte{0x89, 0x50, 0x4e}),
+		},
+		{
+			name:             "ok with relative path",
+			givenPath:        "/",
+			givenFile:        "./go.mod",
+			whenPath:         "/",
+			expectCode:       http.StatusOK,
+			expectStartsWith: "module github.com/labstack/echo/v",
+		},
+		{
+			name:             "nok file does not exist",
+			givenPath:        "/",
+			givenFile:        "./this-file-does-not-exist",
+			whenPath:         "/",
+			expectCode:       http.StatusNotFound,
+			expectStartsWith: "{\"message\":\"Not Found\"}\n",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := New() // we are using echo.defaultFS instance
+			e.File(tc.givenPath, tc.givenFile)
+
+			c, b := request(http.MethodGet, tc.whenPath, e)
+			assert.Equal(t, tc.expectCode, c)
+
+			if len(b) > len(tc.expectStartsWith) {
+				b = b[:len(tc.expectStartsWith)]
+			}
+			assert.Equal(t, tc.expectStartsWith, b)
+		})
+	}
 }
 
 func TestEchoMiddleware(t *testing.T) {
@@ -257,36 +669,37 @@ func TestEchoMiddleware(t *testing.T) {
 	buf := new(bytes.Buffer)
 
 	e.Pre(func(next HandlerFunc) HandlerFunc {
-		return func(c Context) error {
-			assert.Empty(t, c.Path())
+		return func(c *Context) error {
+			// before route match is found RouteInfo does not exist
+			assert.Equal(t, RouteInfo{}, c.RouteInfo())
 			buf.WriteString("-1")
 			return next(c)
 		}
 	})
 
 	e.Use(func(next HandlerFunc) HandlerFunc {
-		return func(c Context) error {
+		return func(c *Context) error {
 			buf.WriteString("1")
 			return next(c)
 		}
 	})
 
 	e.Use(func(next HandlerFunc) HandlerFunc {
-		return func(c Context) error {
+		return func(c *Context) error {
 			buf.WriteString("2")
 			return next(c)
 		}
 	})
 
 	e.Use(func(next HandlerFunc) HandlerFunc {
-		return func(c Context) error {
+		return func(c *Context) error {
 			buf.WriteString("3")
 			return next(c)
 		}
 	})
 
 	// Route
-	e.GET("/", func(c Context) error {
+	e.GET("/", func(c *Context) error {
 		return c.String(http.StatusOK, "OK")
 	})
 
@@ -299,11 +712,11 @@ func TestEchoMiddleware(t *testing.T) {
 func TestEchoMiddlewareError(t *testing.T) {
 	e := New()
 	e.Use(func(next HandlerFunc) HandlerFunc {
-		return func(c Context) error {
+		return func(c *Context) error {
 			return errors.New("error")
 		}
 	})
-	e.GET("/", NotFoundHandler)
+	e.GET("/", notFoundHandler)
 	c, _ := request(http.MethodGet, "/", e)
 	assert.Equal(t, http.StatusInternalServerError, c)
 }
@@ -312,7 +725,7 @@ func TestEchoHandler(t *testing.T) {
 	e := New()
 
 	// HandlerFunc
-	e.GET("/ok", func(c Context) error {
+	e.GET("/ok", func(c *Context) error {
 		return c.String(http.StatusOK, "OK")
 	})
 
@@ -323,161 +736,287 @@ func TestEchoHandler(t *testing.T) {
 
 func TestEchoWrapHandler(t *testing.T) {
 	e := New()
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	c := e.NewContext(req, rec)
-	h := WrapHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+	var actualID string
+	var actualPattern string
+	e.GET("/:id", WrapHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("test"))
-	}))
-	if assert.NoError(t, h(c)) {
-		assert.Equal(t, http.StatusOK, rec.Code)
-		assert.Equal(t, "test", rec.Body.String())
-	}
+		actualID = r.PathValue("id")
+		actualPattern = r.Pattern
+	})))
+
+	req := httptest.NewRequest(http.MethodGet, "/123", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "test", rec.Body.String())
+	assert.Equal(t, "123", actualID)
+	assert.Equal(t, "/:id", actualPattern)
 }
 
 func TestEchoWrapMiddleware(t *testing.T) {
 	e := New()
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	c := e.NewContext(req, rec)
-	buf := new(bytes.Buffer)
-	mw := WrapMiddleware(func(h http.Handler) http.Handler {
+
+	var actualID string
+	var actualPattern string
+	e.Use(WrapMiddleware(func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			buf.Write([]byte("mw"))
+			actualID = r.PathValue("id")
+			actualPattern = r.Pattern
 			h.ServeHTTP(w, r)
 		})
+	}))
+
+	e.GET("/:id", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
 	})
-	h := mw(func(c Context) error {
-		return c.String(http.StatusOK, "OK")
-	})
-	if assert.NoError(t, h(c)) {
-		assert.Equal(t, "mw", buf.String())
-		assert.Equal(t, http.StatusOK, rec.Code)
-		assert.Equal(t, "OK", rec.Body.String())
-	}
+
+	req := httptest.NewRequest(http.MethodGet, "/123", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusTeapot, rec.Code)
+	assert.Equal(t, "OK", rec.Body.String())
+	assert.Equal(t, "123", actualID)
+	assert.Equal(t, "/:id", actualPattern)
 }
 
 func TestEchoConnect(t *testing.T) {
 	e := New()
-	testMethod(t, http.MethodConnect, "/", e)
+
+	ri := e.CONNECT("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	assert.Equal(t, http.MethodConnect, ri.Method)
+	assert.Equal(t, "/", ri.Path)
+	assert.Equal(t, http.MethodConnect+":/", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(http.MethodConnect, "/", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, "OK", body)
 }
 
 func TestEchoDelete(t *testing.T) {
 	e := New()
-	testMethod(t, http.MethodDelete, "/", e)
+
+	ri := e.DELETE("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	assert.Equal(t, http.MethodDelete, ri.Method)
+	assert.Equal(t, "/", ri.Path)
+	assert.Equal(t, http.MethodDelete+":/", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(http.MethodDelete, "/", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, "OK", body)
 }
 
 func TestEchoGet(t *testing.T) {
 	e := New()
-	testMethod(t, http.MethodGet, "/", e)
+
+	ri := e.GET("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	assert.Equal(t, http.MethodGet, ri.Method)
+	assert.Equal(t, "/", ri.Path)
+	assert.Equal(t, http.MethodGet+":/", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(http.MethodGet, "/", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, "OK", body)
 }
 
 func TestEchoHead(t *testing.T) {
 	e := New()
-	testMethod(t, http.MethodHead, "/", e)
+
+	ri := e.HEAD("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	assert.Equal(t, http.MethodHead, ri.Method)
+	assert.Equal(t, "/", ri.Path)
+	assert.Equal(t, http.MethodHead+":/", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(http.MethodHead, "/", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, "OK", body)
 }
 
 func TestEchoOptions(t *testing.T) {
 	e := New()
-	testMethod(t, http.MethodOptions, "/", e)
+
+	ri := e.OPTIONS("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	assert.Equal(t, http.MethodOptions, ri.Method)
+	assert.Equal(t, "/", ri.Path)
+	assert.Equal(t, http.MethodOptions+":/", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(http.MethodOptions, "/", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, "OK", body)
 }
 
 func TestEchoPatch(t *testing.T) {
 	e := New()
-	testMethod(t, http.MethodPatch, "/", e)
+
+	ri := e.PATCH("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	assert.Equal(t, http.MethodPatch, ri.Method)
+	assert.Equal(t, "/", ri.Path)
+	assert.Equal(t, http.MethodPatch+":/", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(http.MethodPatch, "/", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, "OK", body)
 }
 
 func TestEchoPost(t *testing.T) {
 	e := New()
-	testMethod(t, http.MethodPost, "/", e)
+
+	ri := e.POST("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	assert.Equal(t, http.MethodPost, ri.Method)
+	assert.Equal(t, "/", ri.Path)
+	assert.Equal(t, http.MethodPost+":/", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(http.MethodPost, "/", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, "OK", body)
 }
 
 func TestEchoPut(t *testing.T) {
 	e := New()
-	testMethod(t, http.MethodPut, "/", e)
+
+	ri := e.PUT("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	assert.Equal(t, http.MethodPut, ri.Method)
+	assert.Equal(t, "/", ri.Path)
+	assert.Equal(t, http.MethodPut+":/", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(http.MethodPut, "/", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, "OK", body)
 }
 
 func TestEchoTrace(t *testing.T) {
 	e := New()
-	testMethod(t, http.MethodTrace, "/", e)
+
+	ri := e.TRACE("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	assert.Equal(t, http.MethodTrace, ri.Method)
+	assert.Equal(t, "/", ri.Path)
+	assert.Equal(t, http.MethodTrace+":/", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(http.MethodTrace, "/", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, "OK", body)
 }
 
-func TestEchoAny(t *testing.T) { // JFC
+func TestEchoQuery(t *testing.T) {
 	e := New()
-	e.Any("/", func(c Context) error {
-		return c.String(http.StatusOK, "Any")
+
+	ri := e.QUERY("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
 	})
+
+	assert.Equal(t, QUERY, ri.Method)
+	assert.Equal(t, "/", ri.Path)
+	assert.Equal(t, QUERY+":/", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(QUERY, "/", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, "OK", body)
+}
+
+func TestEcho_Any(t *testing.T) {
+	e := New()
+
+	ri := e.Any("/activate", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK from ANY")
+	})
+
+	assert.Equal(t, RouteAny, ri.Method)
+	assert.Equal(t, "/activate", ri.Path)
+	assert.Equal(t, RouteAny+":/activate", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(http.MethodTrace, "/activate", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, `OK from ANY`, body)
+}
+
+func TestEcho_Any_matchesArbitraryMethod(t *testing.T) {
+	e := New()
+
+	e.Any("/activate", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK from ANY")
+	})
+
+	// ARBITRARY-METHOD is not one of Echo's known HTTP methods; the RouteAny
+	// fallback must still match it.
+	status, body := request("ARBITRARY-METHOD", "/activate", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, `OK from ANY`, body)
+}
+
+func TestEcho_Any_hasLowerPriority(t *testing.T) {
+	e := New()
+
+	e.Any("/activate", func(c *Context) error {
+		return c.String(http.StatusTeapot, "ANY")
+	})
+	e.GET("/activate", func(c *Context) error {
+		return c.String(http.StatusLocked, "GET")
+	})
+
+	status, body := request(http.MethodTrace, "/activate", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, `ANY`, body)
+
+	status, body = request(http.MethodGet, "/activate", e)
+	assert.Equal(t, http.StatusLocked, status)
+	assert.Equal(t, `GET`, body)
 }
 
 func TestEchoMatch(t *testing.T) { // JFC
 	e := New()
-	e.Match([]string{http.MethodGet, http.MethodPost}, "/", func(c Context) error {
+	ris := e.Match([]string{http.MethodGet, http.MethodPost}, "/", func(c *Context) error {
 		return c.String(http.StatusOK, "Match")
 	})
-}
-
-func TestEchoURL(t *testing.T) {
-	e := New()
-	static := func(Context) error { return nil }
-	getUser := func(Context) error { return nil }
-	getAny := func(Context) error { return nil }
-	getFile := func(Context) error { return nil }
-
-	e.GET("/static/file", static)
-	e.GET("/users/:id", getUser)
-	e.GET("/documents/*", getAny)
-	g := e.Group("/group")
-	g.GET("/users/:uid/files/:fid", getFile)
-
-	assert := assert.New(t)
-
-	assert.Equal("/static/file", e.URL(static))
-	assert.Equal("/users/:id", e.URL(getUser))
-	assert.Equal("/users/1", e.URL(getUser, "1"))
-	assert.Equal("/users/1", e.URL(getUser, "1"))
-	assert.Equal("/documents/foo.txt", e.URL(getAny, "foo.txt"))
-	assert.Equal("/documents/*", e.URL(getAny))
-	assert.Equal("/group/users/1/files/:fid", e.URL(getFile, "1"))
-	assert.Equal("/group/users/1/files/1", e.URL(getFile, "1", "1"))
-}
-
-func TestEchoRoutes(t *testing.T) {
-	e := New()
-	routes := []*Route{
-		{http.MethodGet, "/users/:user/events", ""},
-		{http.MethodGet, "/users/:user/events/public", ""},
-		{http.MethodPost, "/repos/:owner/:repo/git/refs", ""},
-		{http.MethodPost, "/repos/:owner/:repo/git/tags", ""},
-	}
-	for _, r := range routes {
-		e.Add(r.Method, r.Path, func(c Context) error {
-			return c.String(http.StatusOK, "OK")
-		})
-	}
-
-	if assert.Equal(t, len(routes), len(e.Routes())) {
-		for _, r := range e.Routes() {
-			found := false
-			for _, rr := range routes {
-				if r.Method == rr.Method && r.Path == rr.Path {
-					found = true
-					break
-				}
-			}
-			if !found {
-				t.Errorf("Route %s %s not found", r.Method, r.Path)
-			}
-		}
-	}
+	assert.Len(t, ris, 2)
 }
 
 func TestEchoServeHTTPPathEncoding(t *testing.T) {
 	e := New()
-	e.GET("/with/slash", func(c Context) error {
+	e.GET("/with/slash", func(c *Context) error {
 		return c.String(http.StatusOK, "/with/slash")
 	})
-	e.GET("/:id", func(c Context) error {
+	e.GET("/:id", func(c *Context) error {
 		return c.String(http.StatusOK, c.Param("id"))
 	})
 
@@ -517,13 +1056,13 @@ func TestEchoServeHTTPPathEncoding(t *testing.T) {
 func TestEchoGroup(t *testing.T) {
 	e := New()
 	buf := new(bytes.Buffer)
-	e.Use(MiddlewareFunc(func(next HandlerFunc) HandlerFunc {
-		return func(c Context) error {
+	e.Use(func(next HandlerFunc) HandlerFunc {
+		return func(c *Context) error {
 			buf.WriteString("0")
 			return next(c)
 		}
-	}))
-	h := func(c Context) error {
+	})
+	h := func(c *Context) error {
 		return c.NoContent(http.StatusOK)
 	}
 
@@ -536,7 +1075,7 @@ func TestEchoGroup(t *testing.T) {
 	// Group
 	g1 := e.Group("/group1")
 	g1.Use(func(next HandlerFunc) HandlerFunc {
-		return func(c Context) error {
+		return func(c *Context) error {
 			buf.WriteString("1")
 			return next(c)
 		}
@@ -546,14 +1085,14 @@ func TestEchoGroup(t *testing.T) {
 	// Nested groups with middleware
 	g2 := e.Group("/group2")
 	g2.Use(func(next HandlerFunc) HandlerFunc {
-		return func(c Context) error {
+		return func(c *Context) error {
 			buf.WriteString("2")
 			return next(c)
 		}
 	})
 	g3 := g2.Group("/group3")
 	g3.Use(func(next HandlerFunc) HandlerFunc {
-		return func(c Context) error {
+		return func(c *Context) error {
 			buf.WriteString("3")
 			return next(c)
 		}
@@ -572,6 +1111,70 @@ func TestEchoGroup(t *testing.T) {
 	assert.Equal(t, "023", buf.String())
 }
 
+func TestEcho_RouteNotFound(t *testing.T) {
+	var testCases = []struct {
+		expectRoute any
+		name        string
+		whenURL     string
+		expectCode  int
+	}{
+		{
+			name:        "404, route to static not found handler /a/c/xx",
+			whenURL:     "/a/c/xx",
+			expectRoute: "GET /a/c/xx",
+			expectCode:  http.StatusNotFound,
+		},
+		{
+			name:        "404, route to path param not found handler /a/:file",
+			whenURL:     "/a/echo.exe",
+			expectRoute: "GET /a/:file",
+			expectCode:  http.StatusNotFound,
+		},
+		{
+			name:        "404, route to any not found handler /*",
+			whenURL:     "/b/echo.exe",
+			expectRoute: "GET /*",
+			expectCode:  http.StatusNotFound,
+		},
+		{
+			name:        "200, route /a/c/df to /a/c/df",
+			whenURL:     "/a/c/df",
+			expectRoute: "GET /a/c/df",
+			expectCode:  http.StatusOK,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := New()
+
+			okHandler := func(c *Context) error {
+				return c.String(http.StatusOK, c.Request().Method+" "+c.Path())
+			}
+			notFoundHandler := func(c *Context) error {
+				return c.String(http.StatusNotFound, c.Request().Method+" "+c.Path())
+			}
+
+			e.GET("/", okHandler)
+			e.GET("/a/c/df", okHandler)
+			e.GET("/a/b*", okHandler)
+			e.PUT("/*", okHandler)
+
+			e.RouteNotFound("/a/c/xx", notFoundHandler)  // static
+			e.RouteNotFound("/a/:file", notFoundHandler) // param
+			e.RouteNotFound("/*", notFoundHandler)       // any
+
+			req := httptest.NewRequest(http.MethodGet, tc.whenURL, nil)
+			rec := httptest.NewRecorder()
+
+			e.ServeHTTP(rec, req)
+
+			assert.Equal(t, tc.expectCode, rec.Code)
+			assert.Equal(t, tc.expectRoute, rec.Body.String())
+		})
+	}
+}
+
 func TestEchoNotFound(t *testing.T) {
 	e := New()
 	req := httptest.NewRequest(http.MethodGet, "/files", nil)
@@ -582,355 +1185,143 @@ func TestEchoNotFound(t *testing.T) {
 
 func TestEchoMethodNotAllowed(t *testing.T) {
 	e := New()
-	e.GET("/", func(c Context) error {
+
+	e.GET("/", func(c *Context) error {
 		return c.String(http.StatusOK, "Echo!")
 	})
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
+
 	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	assert.Equal(t, "OPTIONS, GET", rec.Header().Get(HeaderAllow))
+}
+
+func TestEcho_OnAddRoute(t *testing.T) {
+	exampleRoute := Route{
+		Method:      http.MethodGet,
+		Path:        "/api/files/:id",
+		Handler:     notFoundHandler,
+		Middlewares: nil,
+		Name:        "x",
+	}
+
+	var testCases = []struct {
+		whenRoute   Route
+		whenError   error
+		name        string
+		expectError string
+		expectAdded []string
+		expectLen   int
+	}{
+		{
+			name:        "ok",
+			whenRoute:   exampleRoute,
+			whenError:   nil,
+			expectAdded: []string{"/static", "/api/files/:id"},
+			expectError: "",
+			expectLen:   2,
+		},
+		{
+			name:        "nok, error is returned",
+			whenRoute:   exampleRoute,
+			whenError:   errors.New("nope"),
+			expectAdded: []string{"/static"},
+			expectError: "nope",
+			expectLen:   1,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+
+			e := New()
+
+			added := make([]string, 0)
+			cnt := 0
+			e.OnAddRoute = func(route Route) error {
+				if cnt > 0 && tc.whenError != nil { // we want to GET /static to succeed for nok tests
+					return tc.whenError
+				}
+				cnt++
+				added = append(added, route.Path)
+				return nil
+			}
+
+			e.GET("/static", notFoundHandler)
+
+			var err error
+			_, err = e.AddRoute(tc.whenRoute)
+
+			if tc.expectError != "" {
+				assert.EqualError(t, err, tc.expectError)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			assert.Len(t, e.Router().Routes(), tc.expectLen)
+			assert.Equal(t, tc.expectAdded, added)
+		})
+	}
 }
 
 func TestEchoContext(t *testing.T) {
 	e := New()
 	c := e.AcquireContext()
-	assert.IsType(t, new(context), c)
+	assert.IsType(t, new(Context), c)
 	e.ReleaseContext(c)
 }
 
-func waitForServerStart(e *Echo, errChan <-chan error, isTLS bool) error {
-	ctx, cancel := stdContext.WithTimeout(stdContext.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			var addr net.Addr
-			if isTLS {
-				addr = e.TLSListenerAddr()
-			} else {
-				addr = e.ListenerAddr()
-			}
-			if addr != nil && strings.Contains(addr.String(), ":") {
-				return nil // was started
-			}
-		case err := <-errChan:
-			if err == http.ErrServerClosed {
-				return nil
-			}
-			return err
-		}
-	}
-}
-
-func TestEchoStart(t *testing.T) {
+func TestPreMiddlewares(t *testing.T) {
 	e := New()
-	errChan := make(chan error)
+	assert.Equal(t, 0, len(e.PreMiddlewares()))
 
-	go func() {
-		err := e.Start(":0")
-		if err != nil {
-			errChan <- err
+	e.Pre(func(next HandlerFunc) HandlerFunc {
+		return func(c *Context) error {
+			return next(c)
 		}
-	}()
-
-	err := waitForServerStart(e, errChan, false)
-	assert.NoError(t, err)
-
-	assert.NoError(t, e.Close())
-}
-
-func TestEcho_StartTLS(t *testing.T) {
-	var testCases = []struct {
-		name        string
-		addr        string
-		certFile    string
-		keyFile     string
-		expectError string
-	}{
-		{
-			name: "ok",
-			addr: ":0",
-		},
-		{
-			name:        "nok, invalid certFile",
-			addr:        ":0",
-			certFile:    "not existing",
-			expectError: "open not existing: no such file or directory",
-		},
-		{
-			name:        "nok, invalid keyFile",
-			addr:        ":0",
-			keyFile:     "not existing",
-			expectError: "open not existing: no such file or directory",
-		},
-		{
-			name:        "nok, failed to create cert out of certFile and keyFile",
-			addr:        ":0",
-			keyFile:     "_fixture/certs/cert.pem", // we are passing cert instead of key
-			expectError: "tls: found a certificate rather than a key in the PEM for the private key",
-		},
-		{
-			name:        "nok, invalid tls address",
-			addr:        "nope",
-			expectError: "listen tcp: address nope: missing port in address",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			e := New()
-			errChan := make(chan error)
-
-			go func() {
-				certFile := "_fixture/certs/cert.pem"
-				if tc.certFile != "" {
-					certFile = tc.certFile
-				}
-				keyFile := "_fixture/certs/key.pem"
-				if tc.keyFile != "" {
-					keyFile = tc.keyFile
-				}
-
-				err := e.StartTLS(tc.addr, certFile, keyFile)
-				if err != nil {
-					errChan <- err
-				}
-			}()
-
-			err := waitForServerStart(e, errChan, true)
-			if tc.expectError != "" {
-				if _, ok := err.(*os.PathError); ok {
-					assert.Error(t, err) // error messages for unix and windows are different. so test only error type here
-				} else {
-					assert.EqualError(t, err, tc.expectError)
-				}
-			} else {
-				assert.NoError(t, err)
-			}
-
-			assert.NoError(t, e.Close())
-		})
-	}
-}
-
-func TestEchoStartTLSAndStart(t *testing.T) {
-	// We test if Echo and listeners work correctly when Echo is simultaneously attached to HTTP and HTTPS server
-	e := New()
-	e.GET("/", func(c Context) error {
-		return c.String(http.StatusOK, "OK")
 	})
 
-	errTLSChan := make(chan error)
-	go func() {
-		certFile := "_fixture/certs/cert.pem"
-		keyFile := "_fixture/certs/key.pem"
-		err := e.StartTLS("localhost:", certFile, keyFile)
-		if err != nil {
-			errTLSChan <- err
+	assert.Equal(t, 1, len(e.PreMiddlewares()))
+}
+
+func TestMiddlewares(t *testing.T) {
+	e := New()
+	assert.Equal(t, 0, len(e.Middlewares()))
+
+	e.Use(func(next HandlerFunc) HandlerFunc {
+		return func(c *Context) error {
+			return next(c)
 		}
-	}()
-
-	err := waitForServerStart(e, errTLSChan, true)
-	assert.NoError(t, err)
-	defer func() {
-		if err := e.Shutdown(stdContext.Background()); err != nil {
-			t.Error(err)
-		}
-	}()
-
-	// check if HTTPS works (note: we are using self signed certs so InsecureSkipVerify=true)
-	client := &http.Client{Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}}
-	res, err := client.Get("https://" + e.TLSListenerAddr().String())
-	assert.NoError(t, err)
-	assert.Equal(t, http.StatusOK, res.StatusCode)
-
-	errChan := make(chan error)
-	go func() {
-		err := e.Start("localhost:")
-		if err != nil {
-			errChan <- err
-		}
-	}()
-	err = waitForServerStart(e, errChan, false)
-	assert.NoError(t, err)
-
-	// now we are serving both HTTPS and HTTP listeners. see if HTTP works in addition to HTTPS
-	res, err = http.Get("http://" + e.ListenerAddr().String())
-	assert.NoError(t, err)
-	assert.Equal(t, http.StatusOK, res.StatusCode)
-
-	// see if HTTPS works after HTTP listener is also added
-	res, err = client.Get("https://" + e.TLSListenerAddr().String())
-	assert.NoError(t, err)
-	assert.Equal(t, http.StatusOK, res.StatusCode)
-}
-
-func TestEchoStartTLSByteString(t *testing.T) {
-	cert, err := ioutil.ReadFile("_fixture/certs/cert.pem")
-	require.NoError(t, err)
-	key, err := ioutil.ReadFile("_fixture/certs/key.pem")
-	require.NoError(t, err)
-
-	testCases := []struct {
-		cert        interface{}
-		key         interface{}
-		expectedErr error
-		name        string
-	}{
-		{
-			cert:        "_fixture/certs/cert.pem",
-			key:         "_fixture/certs/key.pem",
-			expectedErr: nil,
-			name:        `ValidCertAndKeyFilePath`,
-		},
-		{
-			cert:        cert,
-			key:         key,
-			expectedErr: nil,
-			name:        `ValidCertAndKeyByteString`,
-		},
-		{
-			cert:        cert,
-			key:         1,
-			expectedErr: ErrInvalidCertOrKeyType,
-			name:        `InvalidKeyType`,
-		},
-		{
-			cert:        0,
-			key:         key,
-			expectedErr: ErrInvalidCertOrKeyType,
-			name:        `InvalidCertType`,
-		},
-		{
-			cert:        0,
-			key:         1,
-			expectedErr: ErrInvalidCertOrKeyType,
-			name:        `InvalidCertAndKeyTypes`,
-		},
-	}
-
-	for _, test := range testCases {
-		test := test
-		t.Run(test.name, func(t *testing.T) {
-			e := New()
-			e.HideBanner = true
-
-			errChan := make(chan error, 0)
-
-			go func() {
-				errChan <- e.StartTLS(":0", test.cert, test.key)
-			}()
-
-			err := waitForServerStart(e, errChan, true)
-			if test.expectedErr != nil {
-				assert.EqualError(t, err, test.expectedErr.Error())
-			} else {
-				assert.NoError(t, err)
-			}
-
-			assert.NoError(t, e.Close())
-		})
-	}
-}
-
-func TestEcho_StartAutoTLS(t *testing.T) {
-	var testCases = []struct {
-		name        string
-		addr        string
-		expectError string
-	}{
-		{
-			name: "ok",
-			addr: ":0",
-		},
-		{
-			name:        "nok, invalid address",
-			addr:        "nope",
-			expectError: "listen tcp: address nope: missing port in address",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			e := New()
-			errChan := make(chan error, 0)
-
-			go func() {
-				errChan <- e.StartAutoTLS(tc.addr)
-			}()
-
-			err := waitForServerStart(e, errChan, true)
-			if tc.expectError != "" {
-				assert.EqualError(t, err, tc.expectError)
-			} else {
-				assert.NoError(t, err)
-			}
-
-			assert.NoError(t, e.Close())
-		})
-	}
-}
-
-func TestEcho_StartH2CServer(t *testing.T) {
-	var testCases = []struct {
-		name        string
-		addr        string
-		expectError string
-	}{
-		{
-			name: "ok",
-			addr: ":0",
-		},
-		{
-			name:        "nok, invalid address",
-			addr:        "nope",
-			expectError: "listen tcp: address nope: missing port in address",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			e := New()
-			e.Debug = true
-			h2s := &http2.Server{}
-
-			errChan := make(chan error)
-			go func() {
-				err := e.StartH2CServer(tc.addr, h2s)
-				if err != nil {
-					errChan <- err
-				}
-			}()
-
-			err := waitForServerStart(e, errChan, false)
-			if tc.expectError != "" {
-				assert.EqualError(t, err, tc.expectError)
-			} else {
-				assert.NoError(t, err)
-			}
-
-			assert.NoError(t, e.Close())
-		})
-	}
-}
-
-func testMethod(t *testing.T, method, path string, e *Echo) {
-	p := reflect.ValueOf(path)
-	h := reflect.ValueOf(func(c Context) error {
-		return c.String(http.StatusOK, method)
 	})
-	i := interface{}(e)
-	reflect.ValueOf(i).MethodByName(method).Call([]reflect.Value{p, h})
-	_, body := request(method, path, e)
-	assert.Equal(t, method, body)
+
+	assert.Equal(t, 1, len(e.Middlewares()))
+}
+
+func TestEcho_Start(t *testing.T) {
+	e := New()
+	e.GET("/", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
+	})
+	rndPort, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rndPort.Close()
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- e.Start(rndPort.Addr().String())
+	}()
+
+	select {
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("start did not error out")
+	case err := <-errChan:
+		expectContains := "bind: address already in use"
+		if runtime.GOOS == "windows" {
+			expectContains = "bind: Only one usage of each socket address"
+		}
+		assert.Contains(t, err.Error(), expectContains)
+	}
 }
 
 func request(method, path string, e *Echo) (int, string) {
@@ -940,333 +1331,462 @@ func request(method, path string, e *Echo) (int, string) {
 	return rec.Code, rec.Body.String()
 }
 
-func TestHTTPError(t *testing.T) {
-	t.Run("non-internal", func(t *testing.T) {
-		err := NewHTTPError(http.StatusBadRequest, map[string]interface{}{
-			"code": 12,
-		})
-
-		assert.Equal(t, "code=400, message=map[code:12]", err.Error())
-	})
-	t.Run("internal", func(t *testing.T) {
-		err := NewHTTPError(http.StatusBadRequest, map[string]interface{}{
-			"code": 12,
-		})
-		err.SetInternal(errors.New("internal error"))
-		assert.Equal(t, "code=400, message=map[code:12], internal=internal error", err.Error())
-	})
+type customError struct {
+	Code    int
+	Message string
 }
 
-func TestHTTPError_Unwrap(t *testing.T) {
-	t.Run("non-internal", func(t *testing.T) {
-		err := NewHTTPError(http.StatusBadRequest, map[string]interface{}{
-			"code": 12,
-		})
+func (ce *customError) StatusCode() int {
+	return ce.Code
+}
 
-		assert.Nil(t, errors.Unwrap(err))
-	})
-	t.Run("internal", func(t *testing.T) {
-		err := NewHTTPError(http.StatusBadRequest, map[string]interface{}{
-			"code": 12,
-		})
-		err.SetInternal(errors.New("internal error"))
-		assert.Equal(t, "internal error", errors.Unwrap(err).Error())
-	})
+func (ce *customError) MarshalJSON() ([]byte, error) {
+	return fmt.Appendf(nil, `{"x":"%v"}`, ce.Message), nil
+}
+
+func (ce *customError) Error() string {
+	return ce.Message
 }
 
 func TestDefaultHTTPErrorHandler(t *testing.T) {
-	e := New()
-	e.Debug = true
-	e.Any("/plain", func(c Context) error {
-		return errors.New("An error occurred")
-	})
-	e.Any("/badrequest", func(c Context) error {
-		return NewHTTPError(http.StatusBadRequest, "Invalid request")
-	})
-	e.Any("/servererror", func(c Context) error {
-		return NewHTTPError(http.StatusInternalServerError, map[string]interface{}{
-			"code":    33,
-			"message": "Something bad happened",
-			"error":   "stackinfo",
-		})
-	})
-	// With Debug=true plain response contains error message
-	c, b := request(http.MethodGet, "/plain", e)
-	assert.Equal(t, http.StatusInternalServerError, c)
-	assert.Equal(t, "{\n  \"error\": \"An error occurred\",\n  \"message\": \"Internal Server Error\"\n}\n", b)
-	// and special handling for HTTPError
-	c, b = request(http.MethodGet, "/badrequest", e)
-	assert.Equal(t, http.StatusBadRequest, c)
-	assert.Equal(t, "{\n  \"error\": \"code=400, message=Invalid request\",\n  \"message\": \"Invalid request\"\n}\n", b)
-	// complex errors are serialized to pretty JSON
-	c, b = request(http.MethodGet, "/servererror", e)
-	assert.Equal(t, http.StatusInternalServerError, c)
-	assert.Equal(t, "{\n  \"code\": 33,\n  \"error\": \"stackinfo\",\n  \"message\": \"Something bad happened\"\n}\n", b)
-
-	e.Debug = false
-	// With Debug=false the error response is shortened
-	c, b = request(http.MethodGet, "/plain", e)
-	assert.Equal(t, http.StatusInternalServerError, c)
-	assert.Equal(t, "{\"message\":\"Internal Server Error\"}\n", b)
-	c, b = request(http.MethodGet, "/badrequest", e)
-	assert.Equal(t, http.StatusBadRequest, c)
-	assert.Equal(t, "{\"message\":\"Invalid request\"}\n", b)
-	// No difference for error response with non plain string errors
-	c, b = request(http.MethodGet, "/servererror", e)
-	assert.Equal(t, http.StatusInternalServerError, c)
-	assert.Equal(t, "{\"code\":33,\"error\":\"stackinfo\",\"message\":\"Something bad happened\"}\n", b)
-}
-
-func TestEchoClose(t *testing.T) {
-	e := New()
-	errCh := make(chan error)
-
-	go func() {
-		errCh <- e.Start(":0")
-	}()
-
-	err := waitForServerStart(e, errCh, false)
-	assert.NoError(t, err)
-
-	if err := e.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	assert.NoError(t, e.Close())
-
-	err = <-errCh
-	assert.Equal(t, err.Error(), "http: Server closed")
-}
-
-func TestEchoShutdown(t *testing.T) {
-	e := New()
-	errCh := make(chan error)
-
-	go func() {
-		errCh <- e.Start(":0")
-	}()
-
-	err := waitForServerStart(e, errCh, false)
-	assert.NoError(t, err)
-
-	if err := e.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := stdContext.WithTimeout(stdContext.Background(), 10*time.Second)
-	defer cancel()
-	assert.NoError(t, e.Shutdown(ctx))
-
-	err = <-errCh
-	assert.Equal(t, err.Error(), "http: Server closed")
-}
-
-var listenerNetworkTests = []struct {
-	test    string
-	network string
-	address string
-}{
-	{"tcp ipv4 address", "tcp", "127.0.0.1:1323"},
-	{"tcp ipv6 address", "tcp", "[::1]:1323"},
-	{"tcp4 ipv4 address", "tcp4", "127.0.0.1:1323"},
-	{"tcp6 ipv6 address", "tcp6", "[::1]:1323"},
-}
-
-func supportsIPv6() bool {
-	addrs, _ := net.InterfaceAddrs()
-	for _, addr := range addrs {
-		// Check if any interface has local IPv6 assigned
-		if strings.Contains(addr.String(), "::1") {
-			return true
-		}
-	}
-	return false
-}
-
-func TestEchoListenerNetwork(t *testing.T) {
-	hasIPv6 := supportsIPv6()
-	for _, tt := range listenerNetworkTests {
-		if !hasIPv6 && strings.Contains(tt.address, "::") {
-			t.Skip("Skipping testing IPv6 for " + tt.address + ", not available")
-			continue
-		}
-		t.Run(tt.test, func(t *testing.T) {
-			e := New()
-			e.ListenerNetwork = tt.network
-
-			// HandlerFunc
-			e.GET("/ok", func(c Context) error {
-				return c.String(http.StatusOK, "OK")
-			})
-
-			errCh := make(chan error)
-
-			go func() {
-				errCh <- e.Start(tt.address)
-			}()
-
-			err := waitForServerStart(e, errCh, false)
-			assert.NoError(t, err)
-
-			if resp, err := http.Get(fmt.Sprintf("http://%s/ok", tt.address)); err == nil {
-				defer resp.Body.Close()
-				assert.Equal(t, http.StatusOK, resp.StatusCode)
-
-				if body, err := ioutil.ReadAll(resp.Body); err == nil {
-					assert.Equal(t, "OK", string(body))
-				} else {
-					assert.Fail(t, err.Error())
-				}
-
-			} else {
-				assert.Fail(t, err.Error())
-			}
-
-			if err := e.Close(); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
-func TestEchoListenerNetworkInvalid(t *testing.T) {
-	e := New()
-	e.ListenerNetwork = "unix"
-
-	// HandlerFunc
-	e.GET("/ok", func(c Context) error {
-		return c.String(http.StatusOK, "OK")
-	})
-
-	assert.Equal(t, ErrInvalidListenerNetwork, e.Start(":1323"))
-}
-
-func TestEchoReverse(t *testing.T) {
-	assert := assert.New(t)
-
-	e := New()
-	dummyHandler := func(Context) error { return nil }
-
-	e.GET("/static", dummyHandler).Name = "/static"
-	e.GET("/static/*", dummyHandler).Name = "/static/*"
-	e.GET("/params/:foo", dummyHandler).Name = "/params/:foo"
-	e.GET("/params/:foo/bar/:qux", dummyHandler).Name = "/params/:foo/bar/:qux"
-	e.GET("/params/:foo/bar/:qux/*", dummyHandler).Name = "/params/:foo/bar/:qux/*"
-
-	assert.Equal("/static", e.Reverse("/static"))
-	assert.Equal("/static", e.Reverse("/static", "missing param"))
-	assert.Equal("/static/*", e.Reverse("/static/*"))
-	assert.Equal("/static/foo.txt", e.Reverse("/static/*", "foo.txt"))
-
-	assert.Equal("/params/:foo", e.Reverse("/params/:foo"))
-	assert.Equal("/params/one", e.Reverse("/params/:foo", "one"))
-	assert.Equal("/params/:foo/bar/:qux", e.Reverse("/params/:foo/bar/:qux"))
-	assert.Equal("/params/one/bar/:qux", e.Reverse("/params/:foo/bar/:qux", "one"))
-	assert.Equal("/params/one/bar/two", e.Reverse("/params/:foo/bar/:qux", "one", "two"))
-	assert.Equal("/params/one/bar/two/three", e.Reverse("/params/:foo/bar/:qux/*", "one", "two", "three"))
-}
-
-func TestEcho_ListenerAddr(t *testing.T) {
-	e := New()
-
-	addr := e.ListenerAddr()
-	assert.Nil(t, addr)
-
-	errCh := make(chan error)
-	go func() {
-		errCh <- e.Start(":0")
-	}()
-
-	err := waitForServerStart(e, errCh, false)
-	assert.NoError(t, err)
-}
-
-func TestEcho_TLSListenerAddr(t *testing.T) {
-	cert, err := ioutil.ReadFile("_fixture/certs/cert.pem")
-	require.NoError(t, err)
-	key, err := ioutil.ReadFile("_fixture/certs/key.pem")
-	require.NoError(t, err)
-
-	e := New()
-
-	addr := e.TLSListenerAddr()
-	assert.Nil(t, addr)
-
-	errCh := make(chan error)
-	go func() {
-		errCh <- e.StartTLS(":0", cert, key)
-	}()
-
-	err = waitForServerStart(e, errCh, true)
-	assert.NoError(t, err)
-}
-
-func TestEcho_StartServer(t *testing.T) {
-	cert, err := ioutil.ReadFile("_fixture/certs/cert.pem")
-	require.NoError(t, err)
-	key, err := ioutil.ReadFile("_fixture/certs/key.pem")
-	require.NoError(t, err)
-	certs, err := tls.X509KeyPair(cert, key)
-	require.NoError(t, err)
-
 	var testCases = []struct {
-		name        string
-		addr        string
-		TLSConfig   *tls.Config
-		expectError string
+		whenError        error
+		name             string
+		whenMethod       string
+		expectBody       string
+		expectLogged     string
+		expectStatus     int
+		givenExposeError bool
+		givenLoggerFunc  bool
 	}{
 		{
-			name: "ok",
-			addr: ":0",
+			name:             "ok, expose error = true, HTTPError, no wrapped err",
+			givenExposeError: true,
+			whenError:        &HTTPError{Code: http.StatusTeapot, Message: "my_error"},
+			expectStatus:     http.StatusTeapot,
+			expectBody:       `{"message":"my_error"}` + "\n",
 		},
 		{
-			name:      "ok, start with TLS",
-			addr:      ":0",
-			TLSConfig: &tls.Config{Certificates: []tls.Certificate{certs}},
+			name:             "ok, expose error = true, HTTPError + wrapped error",
+			givenExposeError: true,
+			whenError:        HTTPError{Code: http.StatusTeapot, Message: "my_error"}.Wrap(errors.New("internal_error")),
+			expectStatus:     http.StatusTeapot,
+			expectBody:       `{"error":"internal_error","message":"my_error"}` + "\n",
 		},
 		{
-			name:        "nok, invalid address",
-			addr:        "nope",
-			expectError: "listen tcp: address nope: missing port in address",
+			name:             "ok, expose error = true, HTTPError + wrapped HTTPError",
+			givenExposeError: true,
+			whenError:        HTTPError{Code: http.StatusTeapot, Message: "my_error"}.Wrap(&HTTPError{Code: http.StatusTeapot, Message: "early_error"}),
+			expectStatus:     http.StatusTeapot,
+			expectBody:       `{"error":"code=418, message=early_error","message":"my_error"}` + "\n",
 		},
 		{
-			name:        "nok, invalid tls address",
-			addr:        "nope",
-			TLSConfig:   &tls.Config{InsecureSkipVerify: true},
-			expectError: "listen tcp: address nope: missing port in address",
+			name:         "ok, expose error = false, HTTPError",
+			whenError:    &HTTPError{Code: http.StatusTeapot, Message: "my_error"},
+			expectStatus: http.StatusTeapot,
+			expectBody:   `{"message":"my_error"}` + "\n",
+		},
+		{
+			name:         "ok, expose error = false, HTTPError, no message",
+			whenError:    &HTTPError{Code: http.StatusTeapot, Message: ""},
+			expectStatus: http.StatusTeapot,
+			expectBody:   `{"message":"I'm a teapot"}` + "\n",
+		},
+		{
+			name:         "ok, expose error = false, HTTPError + internal HTTPError",
+			whenError:    HTTPError{Code: http.StatusTooEarly, Message: "my_error"}.Wrap(&HTTPError{Code: http.StatusTeapot, Message: "early_error"}),
+			expectStatus: http.StatusTooEarly,
+			expectBody:   `{"message":"my_error"}` + "\n",
+		},
+		{
+			name:             "ok, expose error = true, Error",
+			givenExposeError: true,
+			whenError:        fmt.Errorf("my errors wraps: %w", errors.New("internal_error")),
+			expectStatus:     http.StatusInternalServerError,
+			expectBody:       `{"error":"my errors wraps: internal_error","message":"Internal Server Error"}` + "\n",
+		},
+		{
+			name:         "ok, expose error = false, Error",
+			whenError:    fmt.Errorf("my errors wraps: %w", errors.New("internal_error")),
+			expectStatus: http.StatusInternalServerError,
+			expectBody:   `{"message":"Internal Server Error"}` + "\n",
+		},
+		{
+			name:             "ok, http.HEAD, expose error = true, Error",
+			givenExposeError: true,
+			whenMethod:       http.MethodHead,
+			whenError:        fmt.Errorf("my errors wraps: %w", errors.New("internal_error")),
+			expectStatus:     http.StatusInternalServerError,
+			expectBody:       ``,
+		},
+		{
+			name:         "ok, custom error implement MarshalJSON + HTTPStatusCoder",
+			whenMethod:   http.MethodGet,
+			whenError:    &customError{Code: http.StatusTeapot, Message: "custom error msg"},
+			expectStatus: http.StatusTeapot,
+			expectBody:   `{"x":"custom error msg"}` + "\n",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			buf := new(bytes.Buffer)
 			e := New()
-			e.Debug = true
+			e.Logger = slog.New(slog.DiscardHandler)
+			e.Any("/path", func(c *Context) error {
+				return tc.whenError
+			})
 
-			server := new(http.Server)
-			server.Addr = tc.addr
-			if tc.TLSConfig != nil {
-				server.TLSConfig = tc.TLSConfig
+			e.HTTPErrorHandler = DefaultHTTPErrorHandler(tc.givenExposeError)
+
+			method := http.MethodGet
+			if tc.whenMethod != "" {
+				method = tc.whenMethod
 			}
+			c, b := request(method, "/path", e)
 
-			errCh := make(chan error)
-			go func() {
-				errCh <- e.StartServer(server)
-			}()
-
-			err := waitForServerStart(e, errCh, tc.TLSConfig != nil)
-			if tc.expectError != "" {
-				assert.EqualError(t, err, tc.expectError)
-			} else {
-				assert.NoError(t, err)
-			}
-			assert.NoError(t, e.Close())
+			assert.Equal(t, tc.expectStatus, c)
+			assert.Equal(t, tc.expectBody, b)
+			assert.Equal(t, tc.expectLogged, buf.String())
 		})
 	}
 }
 
-func benchmarkEchoRoutes(b *testing.B, routes []*Route) {
+func TestDefaultHTTPErrorHandler_CommitedResponse(t *testing.T) {
 	e := New()
-	req := httptest.NewRequest("GET", "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	resp := httptest.NewRecorder()
+	c := e.NewContext(req, resp)
+
+	c.orgResponse.Committed = true
+	errHandler := DefaultHTTPErrorHandler(false)
+
+	errHandler(c, errors.New("my_error"))
+	assert.Equal(t, http.StatusOK, resp.Code)
+}
+
+func TestRouterAutoHandleHEADFullHTTPHandlerFlow(t *testing.T) {
+	tests := []struct {
+		name                string
+		givenAutoHandleHEAD bool
+		whenMethod          string
+		expectBody          string
+		expectCode          int
+		expectContentLength string
+	}{
+		{
+			name:                "AutoHandleHEAD disabled - HEAD returns 405",
+			givenAutoHandleHEAD: false,
+			whenMethod:          http.MethodHead,
+			expectCode:          http.StatusMethodNotAllowed,
+			expectBody:          "",
+		},
+		{
+			name:                "AutoHandleHEAD enabled - HEAD returns 200 with Content-Length",
+			givenAutoHandleHEAD: true,
+			whenMethod:          http.MethodHead,
+			expectCode:          http.StatusOK,
+			expectBody:          "",
+			expectContentLength: "4",
+		},
+		{
+			name:                "GET request works normally with AutoHandleHEAD enabled",
+			givenAutoHandleHEAD: true,
+			whenMethod:          http.MethodGet,
+			expectCode:          http.StatusOK,
+			expectBody:          "test",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := NewWithConfig(Config{
+				Router: NewRouter(RouterConfig{
+					AutoHandleHEAD: tc.givenAutoHandleHEAD,
+				}),
+			})
+
+			e.GET("/hello", func(c *Context) error {
+				return c.String(http.StatusOK, "test")
+			})
+
+			req := httptest.NewRequest(tc.whenMethod, "/hello", nil)
+			rec := httptest.NewRecorder()
+
+			e.ServeHTTP(rec, req)
+
+			assert.Equal(t, tc.expectCode, rec.Code)
+			assert.Equal(t, tc.expectContentLength, rec.Header().Get(HeaderContentLength))
+			assert.Equal(t, tc.expectBody, rec.Body.String())
+		})
+	}
+}
+
+func TestAutoHeadExplicitHeadTakesPrecedence(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{
+			AutoHandleHEAD: true,
+		}),
+	})
+
+	// Register explicit HEAD route FIRST with custom behavior
+	e.HEAD("/api/users", func(c *Context) error {
+		c.Response().Header().Set("X-Custom-Header", "explicit-head")
+		return c.NoContent(http.StatusTeapot)
+	})
+
+	e.GET("/api/users", func(c *Context) error {
+		return c.JSON(http.StatusNotFound, map[string]string{"name": "John"})
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/api/users", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusTeapot, rec.Code)
+	assert.Equal(t, "explicit-head", rec.Header().Get("X-Custom-Header"))
+	assert.Equal(t, "", rec.Body.String())
+}
+
+func TestRouterAutoHandleHEAD_PathParams(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.GET("/users/:id", func(c *Context) error {
+		return c.String(http.StatusOK, "id="+c.Param("id"))
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/users/42", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, fmt.Sprintf("%d", len("id=42")), rec.Header().Get(HeaderContentLength))
+	assert.Equal(t, "", rec.Body.String())
+}
+
+func TestRouterAutoHandleHEAD_MultipleWriteCalls(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.GET("/multi", func(c *Context) error {
+		c.Response().WriteHeader(http.StatusOK)
+		c.Response().Write([]byte("foo")) // 3
+		c.Response().Write([]byte("bar")) // 3
+		return nil
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/multi", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "6", rec.Header().Get(HeaderContentLength))
+	assert.Equal(t, "", rec.Body.String())
+}
+
+func TestRouterAutoHandleHEAD_ExplicitContentLength(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.GET("/explicit", func(c *Context) error {
+		c.Response().Header().Set(HeaderContentLength, "1000")
+		return c.String(http.StatusOK, "short")
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/explicit", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, "1000", rec.Header().Get(HeaderContentLength))
+}
+
+func TestRouterAutoHandleHEAD_TransferEncoding(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.GET("/chunked", func(c *Context) error {
+		c.Response().Header().Set("Transfer-Encoding", "chunked")
+		return c.String(http.StatusOK, "data")
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/chunked", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, "", rec.Header().Get(HeaderContentLength))
+}
+
+func TestRouterAutoHandleHEAD_204Response(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.GET("/nocontent", func(c *Context) error {
+		return c.NoContent(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/nocontent", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Equal(t, "", rec.Header().Get(HeaderContentLength))
+}
+
+func TestRouterAutoHandleHEAD_304Response(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.GET("/notmodified", func(c *Context) error {
+		return c.NoContent(http.StatusNotModified)
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/notmodified", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusNotModified, rec.Code)
+	assert.Equal(t, "", rec.Header().Get(HeaderContentLength))
+}
+
+func TestRouterAutoHandleHEAD_CustomResponseHeaders(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.GET("/headers", func(c *Context) error {
+		c.Response().Header().Set("X-Foo", "bar")
+		return c.String(http.StatusOK, "body")
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/headers", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, "bar", rec.Header().Get("X-Foo"))
+	assert.Equal(t, "", rec.Body.String())
+}
+
+func TestRouterAutoHandleHEAD_ContentType(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.GET("/json", func(c *Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"key": "value"})
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/json", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Header().Get(HeaderContentType), MIMEApplicationJSON)
+	assert.Equal(t, "", rec.Body.String())
+}
+
+func TestRouterAutoHandleHEAD_WithMiddleware(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+	e.Use(func(next HandlerFunc) HandlerFunc {
+		return func(c *Context) error {
+			c.Response().Header().Set("X-Middleware", "ran")
+			return next(c)
+		}
+	})
+
+	e.GET("/mw", func(c *Context) error {
+		return c.String(http.StatusOK, "body")
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/mw", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, "ran", rec.Header().Get("X-Middleware"))
+	assert.Equal(t, "", rec.Body.String())
+}
+
+func TestRouterAutoHandleHEAD_HandlerError_ErrorHandlerRuns(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.GET("/err", func(c *Context) error {
+		return ErrBadRequest
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/err", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, "", rec.Body.String())
+}
+
+func TestRouterAutoHandleHEAD_NoGetRoute_Returns405(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.POST("/post-only", func(c *Context) error {
+		return c.String(http.StatusOK, "ok")
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/post-only", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+}
+
+func TestRouterAutoHandleHEAD_AnyRoute_NotWrapped(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.Any("/resource", func(c *Context) error {
+		return c.String(http.StatusOK, "any-body")
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/resource", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "any-body", rec.Body.String())
+	// Content-Length must NOT be injected by wrapHeadHandler for RouteAny
+	assert.Equal(t, "", rec.Header().Get(HeaderContentLength))
+}
+
+func TestRouterAutoHandleHEAD_CatchAllRoute(t *testing.T) {
+	e := NewWithConfig(Config{
+		Router: NewRouter(RouterConfig{AutoHandleHEAD: true}),
+	})
+
+	e.GET("/*", func(c *Context) error {
+		return c.String(http.StatusOK, "wildcard")
+	})
+
+	req := httptest.NewRequest(http.MethodHead, "/anything/here", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, fmt.Sprintf("%d", len("wildcard")), rec.Header().Get(HeaderContentLength))
+	assert.Equal(t, "", rec.Body.String())
+}
+
+func benchmarkEchoRoutes(b *testing.B, routes []testRoute) {
+	e := New()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	u := req.URL
 	w := httptest.NewRecorder()
 
@@ -1274,7 +1794,7 @@ func benchmarkEchoRoutes(b *testing.B, routes []*Route) {
 
 	// Add routes
 	for _, route := range routes {
-		e.Add(route.Method, route.Path, func(c Context) error {
+		e.Add(route.Method, route.Path, func(c *Context) error {
 			return nil
 		})
 	}
@@ -1308,4 +1828,180 @@ func BenchmarkEchoGitHubAPIMisses(b *testing.B) {
 
 func BenchmarkEchoParseAPI(b *testing.B) {
 	benchmarkEchoRoutes(b, parseAPI)
+}
+
+func TestSanitizeURI(t *testing.T) {
+	var testCases = []struct {
+		whenURI string
+		expect  string
+	}{
+		{whenURI: "/path/", expect: "/path/"},
+		{whenURI: "//example.com/", expect: "/example.com/"},
+		{whenURI: "/\t/example.com/", expect: "/%09/example.com/"},
+		{whenURI: "/\t\\example.com/", expect: "/%09\\example.com/"},
+		{whenURI: "/\x7f/example.com/", expect: "/%7F/example.com/"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.whenURI, func(t *testing.T) {
+			assert.Equal(t, tc.expect, sanitizeURI(tc.whenURI))
+		})
+	}
+}
+
+func TestEcho_StaticDirectoryRedirect_controlCharacters(t *testing.T) {
+	// GHSA-v753-g4cw-jm48: a tab before `/` must not turn the directory redirect into `//host`.
+	e := New()
+	e.StaticFS("/", fstest.MapFS{"\t/evil.example/x.txt": {Data: []byte("x")}})
+
+	req := httptest.NewRequest(http.MethodGet, "/%09/evil.example", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	location := rec.Header().Get(HeaderLocation)
+	assert.Equal(t, http.StatusMovedPermanently, rec.Code)
+	assert.False(t, strings.ContainsAny(location, "\t\r\n"), "Location must not contain raw control characters: %q", location)
+	assert.Equal(t, "/%09/evil.example/", location)
+}
+
+func TestStaticDirectoryHandler_emptySegmentIsRejected(t *testing.T) {
+	// GHSA-3pmx-cf9f-34xr: `//admin/private.txt` must not bypass the guarded `/admin/*` route.
+	e := NewWithConfig(Config{Filesystem: os.DirFS("./_fixture/dist")})
+	e.Static("/", "public")
+	e.GET("/admin/*", func(c *Context) error {
+		return ErrForbidden
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.URL.Path = "//admin/private.txt" // httptest.NewRequest would parse `//admin` as a host
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.NotContains(t, rec.Body.String(), "private file")
+}
+
+func TestStaticDirectoryHandler_encodedDotsWithPathUnescaping(t *testing.T) {
+	// GHSA-3pmx-cf9f-34xr: with EnablePathUnescapingStaticFiles, dot segments created by unescaping must be rejected too.
+	fsys := fstest.MapFS{"admin/secret.txt": {Data: []byte("SECRET")}, "x/file.txt": {Data: []byte("x")}}
+	for _, u := range []string{"/x/%2e%2e/admin/secret.txt", "/.%2Fadmin/secret.txt", "/x/%252e%252e/admin/secret.txt"} {
+		t.Run(u, func(t *testing.T) {
+			e := NewWithConfig(Config{EnablePathUnescapingStaticFiles: true})
+			e.StaticFS("/", fsys)
+			e.GET("/admin/*", func(c *Context) error {
+				return ErrForbidden
+			})
+
+			req := httptest.NewRequest(http.MethodGet, u, nil)
+			rec := httptest.NewRecorder()
+			e.ServeHTTP(rec, req)
+
+			assert.NotContains(t, rec.Body.String(), "SECRET")
+		})
+	}
+}
+
+// nonValidatingDirFS is a custom fs.FS that does not enforce fs.ValidPath, so a name with ".." escapes its root. Echo
+// must never pass such a name to a user supplied filesystem.
+type nonValidatingDirFS struct{ root string }
+
+func (f nonValidatingDirFS) Open(name string) (fs.File, error) {
+	// treat a backslash as a separator on every OS, like filepath.Join does on Windows
+	return os.Open(filepath.Join(f.root, filepath.FromSlash(strings.ReplaceAll(name, `\`, "/"))))
+}
+
+func TestEcho_StaticFS_nonValidatingCustomFSCannotEscapeRoot(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "public"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "public", "index.txt"), []byte("public"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("secret"), 0o644))
+
+	for _, unescape := range []bool{false, true} {
+		e := NewWithConfig(Config{EnablePathUnescapingStaticFiles: unescape})
+		e.StaticFS("/", nonValidatingDirFS{root: filepath.Join(dir, "public")})
+
+		for _, target := range []string{
+			"/../secret.txt",
+			"/%2e%2e/secret.txt",
+			"/..%2fsecret.txt",
+			"/sub/../../secret.txt",
+			"/..%5csecret.txt",
+			"/..%5Csecret.txt",
+			"/a%5C..%5C..%5Csecret.txt",
+			`/..\secret.txt`,
+		} {
+			req := httptest.NewRequest(http.MethodGet, target, nil)
+			rec := httptest.NewRecorder()
+			e.ServeHTTP(rec, req)
+
+			assert.Equal(t, http.StatusNotFound, rec.Code, "%s unescape=%v", target, unescape)
+			assert.NotContains(t, rec.Body.String(), "secret", "%s unescape=%v", target, unescape)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/index.txt", nil)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "public", rec.Body.String())
+	}
+}
+
+func TestHasDotOrEmptySegment(t *testing.T) {
+	var testCases = []struct {
+		path   string
+		expect bool
+	}{
+		{path: "", expect: false},
+		{path: "/", expect: false},
+		{path: "/index.html", expect: false},
+		{path: "/css/app.css", expect: false},
+		{path: "/..", expect: true},
+		{path: "/a/../b", expect: true},
+		{path: "/a/./b", expect: true},
+		{path: "/a//b", expect: true},
+		{path: `/..\secret.txt`, expect: true},
+		{path: `/a\..\b`, expect: true},
+		{path: `/.\secret.txt`, expect: true},
+		{path: `/\..`, expect: true},
+		{path: `/..\`, expect: true},
+		{path: `/dir\file.txt`, expect: false},
+		{path: "/...", expect: false},
+		{path: "/..foo", expect: false},
+		{path: `/a\\b`, expect: false},
+		{path: "/..%2fsecret.txt", expect: false}, // still encoded, only unsafe once unescaped
+	}
+	for _, tc := range testCases {
+		t.Run(tc.path, func(t *testing.T) {
+			assert.Equal(t, tc.expect, hasDotOrEmptySegment(tc.path))
+		})
+	}
+}
+
+func TestEcho_AddParamRouteAfterServing(t *testing.T) {
+	var testCases = []struct {
+		name   string
+		router Router
+	}{
+		{name: "ok, default router", router: NewRouter(RouterConfig{})},
+		{name: "ok, concurrent router", router: NewConcurrentRouter(NewRouter(RouterConfig{}))},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := NewWithConfig(Config{Router: tc.router})
+			e.GET("/static", func(c *Context) error { return c.String(http.StatusOK, "static") })
+
+			rec := httptest.NewRecorder()
+			e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/static", nil))
+			assert.Equal(t, "static", rec.Body.String())
+
+			// the pooled context from the first request has no PathValues capacity for this route. sync.Pool may hand
+			// out a new context instead (often under -race); TestDefaultRouter_RouteWithContextCreatedBeforeParamRouteAdded
+			// covers the stale context deterministically.
+			e.GET("/users/:id", func(c *Context) error { return c.String(http.StatusOK, c.Param("id")) })
+
+			rec = httptest.NewRecorder()
+			e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/users/42", nil))
+			assert.Equal(t, http.StatusOK, rec.Code)
+			assert.Equal(t, "42", rec.Body.String())
+		})
+	}
 }
